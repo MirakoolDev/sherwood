@@ -16,6 +16,10 @@ import {Sherwood, IDiceEntropy} from "../src/Sherwood.sol";
 /// Stand-in for Dice Protocol: records requests and lets the test reveal them.
 contract MockDice {
     uint128 public fee = 25_000_000_000_000; // 0.000025 ETH, as on Robinhood Chain
+
+    function setFee(uint128 next) external {
+        fee = next;
+    }
     uint64 public nextSequence = 1;
     mapping(uint64 => address) public requester;
 
@@ -426,7 +430,7 @@ contract SherwoodTest is Test, Deployers {
         (,,, uint256[3] memory prize,) = hook.result(day);
         vm.expectRevert(Sherwood.ClaimWindowOpen.selector);
         hook.sweepUnclaimed(day);
-        vm.warp((day + 1) * 1 days + 7 days + 1);
+        vm.warp(hook.claimDeadline(day) + 1); // 7 days after settlement
         uint256 today = hook.currentDay();
         uint256 potBefore = hook.pot(today);
         hook.sweepUnclaimed(day);
@@ -441,9 +445,10 @@ contract SherwoodTest is Test, Deployers {
         _buy(alice, 0.02 ether, Sherwood.Move.BUY);
         _buy(bob, 0.02 ether, Sherwood.Move.FLIP);
         vm.warp((day + 1) * 1 days + 15 minutes);
+        hook.expireFlip(1); // settlement waits for this; the flip scores as a plain buy
         hook.settle(day, 100);
-        dice.reveal(1, bytes32(uint256(2)));
-        assertEq(hook.points(day, bob), 0);
+        dice.reveal(1, bytes32(uint256(2))); // Dice reveals late: nothing changes
+        assertEq(hook.points(day, bob), 20);
     }
 
     // ── Buyback ─────────────────────────────────────────────────────────────────
@@ -472,6 +477,14 @@ contract SherwoodTest is Test, Deployers {
         vm.prank(owner);
         vm.expectRevert(Sherwood.BadBuybackPool.selector);
         hook.setBuybackPool(gameKey);
+    }
+
+    function test_buybackPoolIsSetOnce() public {
+        vm.prank(owner);
+        hook.setBuybackPool(buybackKey);
+        vm.prank(owner);
+        vm.expectRevert(Sherwood.PoolAlreadySet.selector);
+        hook.setBuybackPool(buybackKey);
     }
 
     function test_recentPlayersMostRecentFirst() public {
@@ -594,6 +607,103 @@ contract SherwoodTest is Test, Deployers {
         _buy(bob, 0.01 ether, Sherwood.Move.STEAL); // bob 12 with bonus; steal share from his 10-point size: 22% of 50 = 11
         assertEq(hook.points(day + 1, alice), 39);
         assertEq(hook.points(day + 1, bob), 23);
+    }
+
+    // ── Audit fixes ─────────────────────────────────────────────────────────
+
+    function test_buyStoppedByPriceLimitReverts() public {
+        // Scored on the declared ETH, so a buy must spend all of it (audit H-1).
+        vm.deal(alice, 1 ether);
+        vm.prank(alice, alice);
+        vm.expectRevert();
+        swapRouter.swap{value: 0.1 ether}(
+            gameKey,
+            SwapParams({zeroForOne: true, amountSpecified: -0.1 ether, sqrtPriceLimitX96: SQRT_PRICE_1_1 - 1}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            abi.encode(uint256(Sherwood.Move.BUY))
+        );
+        assertEq(hook.points(_day(), alice), 0);
+    }
+
+    function test_settleWaitsForPendingFlips() public {
+        // A reveal between settlement batches would change scores already ranked (audit M-1).
+        uint256 day = _day();
+        _buy(alice, 0.1 ether, Sherwood.Move.BUY);
+        _buy(bob, 0.06 ether, Sherwood.Move.BUY);
+        _buy(alice, 0.1 ether, Sherwood.Move.FLIP);
+        assertEq(hook.pendingFlips(day), 1);
+        vm.warp((day + 1) * 1 days + 15 minutes);
+        vm.expectRevert(Sherwood.FlipsPending.selector);
+        hook.settle(day, 1);
+        dice.reveal(1, bytes32(uint256(3))); // alice loses: 0, bob 160
+        assertEq(hook.pendingFlips(day), 0);
+        hook.settle(day, 1);
+        assertTrue(hook.settle(day, 1));
+        (, address[3] memory top, int256[3] memory topPoints,,) = hook.result(day);
+        assertEq(top[0], bob);
+        assertEq(topPoints[0], 160);
+        assertEq(top[1], address(0)); // alice at 0 doesn't place
+    }
+
+    function test_expiredFlipsUnblockSettlement() public {
+        uint256 day = _day();
+        _buy(alice, 0.05 ether, Sherwood.Move.FLIP);
+        vm.warp((day + 1) * 1 days + 15 minutes);
+        vm.expectRevert(Sherwood.FlipsPending.selector);
+        hook.settle(day, 10);
+        hook.expireFlip(1);
+        assertTrue(hook.settle(day, 10));
+        (, address[3] memory top,,,) = hook.result(day);
+        assertEq(top[0], alice);
+    }
+
+    function test_flipWinScalesWithBuySizeNotBonus() public {
+        // 0.08 ETH with the holder bonus: stake 100, multiplier from 80 base points = 2.8x (audit L-1).
+        uint256 day = _day();
+        _buy(alice, 0.01 ether, Sherwood.Move.BUY);
+        vm.warp((day + 1) * 1 days + 1);
+        _buy(alice, 0.08 ether, Sherwood.Move.FLIP);
+        dice.reveal(1, bytes32(uint256(2)));
+        assertEq(hook.points(day + 1, alice), 280);
+    }
+
+    function test_robinHoodCanPayTheMover() public {
+        // Accepted design: if you're the lowest of the last 10, Robin Hood pays you (chained moves).
+        _buy(alice, 0.1 ether, Sherwood.Move.BUY); // leader, 100
+        _buy(bob, 0.001 ether, Sherwood.Move.BUY); // bob 1
+        _buy(bob, 0.01 ether, Sherwood.Move.ROBIN_HOOD); // bob 11, the lowest recent: 12.3% of 100 → bob
+        assertEq(hook.points(_day(), alice), 88);
+        assertEq(hook.points(_day(), bob), 23);
+    }
+
+    function test_diceFeeAboveCapScoresAsBuy() public {
+        dice.setFee(0.001 ether);
+        hook.fundPot{value: 1 ether}(_day());
+        _buy(bob, 0.02 ether, Sherwood.Move.FLIP);
+        assertEq(hook.points(_day(), bob), 20); // plain buy, nothing sent to Dice
+        assertEq(hook.pendingFlips(_day()), 0);
+        assertEq(address(dice).balance, 0);
+    }
+
+    function test_diceRefundFromAnywhereGoesToBuybackReserve() public {
+        _buy(alice, 0.02 ether, Sherwood.Move.FLIP);
+        uint256 before = hook.buybackReserve();
+        dice.refundRequest(address(0), 1); // someone else triggers the refund on Dice
+        assertEq(hook.buybackReserve() - before, dice.fee());
+    }
+
+    function test_lateSettlementStillGivesSevenDaysToClaim() public {
+        uint256 day = _day();
+        _buy(alice, 0.05 ether, Sherwood.Move.BUY);
+        vm.warp((day + 1) * 1 days + 8 days); // nobody settled for 8 days
+        hook.settle(day, 100);
+        assertEq(hook.claimDeadline(day), block.timestamp + 7 days);
+        vm.expectRevert(Sherwood.ClaimWindowOpen.selector);
+        hook.sweepUnclaimed(day);
+        uint256 before = alice.balance;
+        vm.prank(alice);
+        hook.claim(day);
+        assertGt(alice.balance, before);
     }
 
     // ── Forfeits and referrals ──────────────────────────────────────────────

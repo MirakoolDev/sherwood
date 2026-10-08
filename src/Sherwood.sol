@@ -75,6 +75,7 @@ contract Sherwood is IHooks, IUnlockCallback {
     uint256 public constant CLAIM_WINDOW = 7 days;
     uint256 public constant FLIP_TIMEOUT = 10 minutes; // an unrevealed flip then scores as a plain buy
     uint32 public constant FLIP_CALLBACK_GAS = 200_000;
+    uint256 public constant MAX_DICE_FEE = 0.0005 ether; // 20x Dice's fee at launch; above it a flip scores as a buy
     uint256 internal constant MAX_LEADER_SCAN = 1500; // bound on the leader rescan inside a swap
     address internal constant DEAD = 0x000000000000000000000000000000000000dEaD;
 
@@ -126,9 +127,11 @@ contract Sherwood is IHooks, IUnlockCallback {
         uint64 day;
         uint64 requestedAt;
         uint96 stake; // points riding on the flip
+        uint96 win; // points a win pays: the stake times a multiplier set by the buy size
     }
 
     mapping(uint64 sequence => PendingFlip) public flips;
+    mapping(uint256 day => uint256) public pendingFlips; // requested that day, not yet revealed or expired
 
     // ── Settlement ──────────────────────────────────────────────────────────────
     struct Result {
@@ -139,6 +142,7 @@ contract Sherwood is IHooks, IUnlockCallback {
         uint256[3] prize;
         bool[3] claimed;
         bool swept;
+        uint64 settledAt;
         uint256[3] held; // $PFWA each winner must still hold to claim (what they held at settlement)
     }
 
@@ -181,6 +185,8 @@ contract Sherwood is IHooks, IUnlockCallback {
     error WrongPool();
     error PoolAlreadySet();
     error ExactOutputNotSupported();
+    error PartialFill();
+    error FlipsPending();
     error DayNotOver();
     error DayPassed();
     error MustHoldToClaim();
@@ -217,7 +223,8 @@ contract Sherwood is IHooks, IUnlockCallback {
     /// ETH from the PoolManager (fees taken) and Dice (refunds) is accounted where it's received.
     /// Anything else sent straight here goes into today's pot instead of getting stuck.
     receive() external payable {
-        if (msg.sender != address(poolManager) && msg.sender != address(dice)) _seed(currentDay(), msg.value);
+        if (msg.sender == address(dice)) buybackReserve += msg.value; // a refunded flip fee
+        else if (msg.sender != address(poolManager)) _seed(currentDay(), msg.value);
     }
 
     /// Anyone can add ETH to today's pot or a future day's, e.g. to seed launch week.
@@ -286,6 +293,10 @@ contract Sherwood is IHooks, IUnlockCallback {
         returns (bytes4, int128)
     {
         if (params.zeroForOne) {
+            // A buy is scored in beforeSwap on the ETH it declares, so it must spend all of it: a
+            // price limit that stops the swap early would score points for ETH never swapped.
+            uint256 declared = uint256(-params.amountSpecified);
+            if (uint256(int256(-delta.amount0())) + (declared * FEE_BPS) / 10_000 < declared) revert PartialFill();
             int128 pfwaOut = delta.amount1();
             if (pfwaOut > 0 && uint256(-params.amountSpecified) >= MIN_BUY) {
                 bought[currentDay()][tx.origin] += uint256(int256(pfwaOut));
@@ -336,7 +347,7 @@ contract Sherwood is IHooks, IUnlockCallback {
         address target;
         uint256 moved;
 
-        if (move == Move.FLIP && _requestFlip(day, player, previous, scored, ethIn)) {
+        if (move == Move.FLIP && _requestFlip(day, player, previous, scored, base, ethIn)) {
             // Points are credited when Dice reveals the flip.
             emit Played(day, player, move, ethIn, 0, previous, 0);
         } else {
@@ -402,7 +413,7 @@ contract Sherwood is IHooks, IUnlockCallback {
     /// Pays the Dice fee out of today's pot and records the pending flip. False if the pot can't
     /// cover it or Dice can't take the request (paused, out of randomness, ...): the move then
     /// scores as a plain buy, so a Dice outage never blocks a swap.
-    function _requestFlip(uint256 day, address player, address previous, uint256 stake, uint256 ethIn)
+    function _requestFlip(uint256 day, address player, address previous, uint256 stake, uint256 base, uint256 ethIn)
         internal
         returns (bool)
     {
@@ -412,7 +423,7 @@ contract Sherwood is IHooks, IUnlockCallback {
         } catch {
             return false;
         }
-        if (pot[day] < diceFee) return false;
+        if (diceFee > MAX_DICE_FEE || pot[day] < diceFee) return false;
         bytes32 userRandom = keccak256(abi.encode(player, ethIn, block.number, block.timestamp, gasleft()));
         uint64 sequence;
         try dice.requestV2{value: diceFee}(diceProvider, userRandom, FLIP_CALLBACK_GAS) returns (uint64 seq) {
@@ -426,8 +437,10 @@ contract Sherwood is IHooks, IUnlockCallback {
             previous: previous == player ? address(0) : previous,
             day: uint64(day),
             requestedAt: uint64(block.timestamp),
-            stake: uint96(stake)
+            stake: uint96(stake),
+            win: uint96((stake * scaledBps(FLIP_WIN_BPS_MIN, FLIP_WIN_BPS_MAX, base)) / 10_000)
         });
+        pendingFlips[day] += 1;
         _join(day, player);
         emit FlipRequested(sequence, day, player, stake);
         return true;
@@ -439,10 +452,11 @@ contract Sherwood is IHooks, IUnlockCallback {
         PendingFlip memory f = flips[sequence];
         if (f.player == address(0)) return; // already expired or unknown
         delete flips[sequence];
+        pendingFlips[f.day] -= 1;
         if (_results[f.day].settled) return; // revealed after its day was settled
         bool won = uint256(randomNumber) % 2 == 0;
         address paidTo = won ? f.player : f.previous;
-        uint256 amount = won ? (uint256(f.stake) * scaledBps(FLIP_WIN_BPS_MIN, FLIP_WIN_BPS_MAX, f.stake)) / 10_000 : f.stake;
+        uint256 amount = won ? f.win : f.stake;
         if (!won) _debit(f.day, f.player, f.stake); // can go below zero
         if (paidTo != address(0)) _credit(f.day, paidTo, amount);
         emit FlipResolved(sequence, f.player, won, paidTo, amount);
@@ -453,6 +467,7 @@ contract Sherwood is IHooks, IUnlockCallback {
         PendingFlip memory f = flips[sequence];
         if (f.player == address(0) || block.timestamp < f.requestedAt + FLIP_TIMEOUT) revert FlipNotExpired();
         delete flips[sequence];
+        pendingFlips[f.day] -= 1;
         if (!_results[f.day].settled) _credit(f.day, f.player, f.stake);
         emit FlipResolved(sequence, f.player, true, f.player, f.stake);
     }
@@ -470,10 +485,10 @@ contract Sherwood is IHooks, IUnlockCallback {
         _join(day, player);
         int256 updated = points[day][player] + int256(amount);
         points[day][player] = updated;
-        if (!_leaderStale[day]) {
-            address leader = _leader[day];
-            if (leader == address(0) || updated > points[day][leader]) _leader[day] = player;
-        }
+        // Even while the cached leader is stale (debited), anyone credited above them takes over: on
+        // a day too big to rescan this keeps the cache moving instead of frozen until midnight.
+        address leader = _leader[day];
+        if (leader == address(0) || updated > points[day][leader]) _leader[day] = player;
     }
 
     function _debit(uint256 day, address player, uint256 amount) internal {
@@ -509,7 +524,8 @@ contract Sherwood is IHooks, IUnlockCallback {
         _recentCount[day] = count + 1;
     }
 
-    /// The lowest-scoring of the last 10 players, other than the leader.
+    /// The lowest-scoring of the last 10 players, other than the leader. That can be the player
+    /// making the move: Robin Hood for yourself is allowed, so moves can be chained.
     function _lowestRecent(uint256 day, address leader) internal view returns (address lowest) {
         uint256 count = _recentCount[day];
         uint256 n = count < RECENT ? count : RECENT;
@@ -529,6 +545,9 @@ contract Sherwood is IHooks, IUnlockCallback {
         if (block.timestamp < (day + 1) * 1 days + SETTLE_DELAY) revert DayNotOver();
         Result storage r = _results[day];
         if (r.settled) revert AlreadySettled();
+        // A reveal between batches would change scores already ranked. Every flip of a finished day
+        // can be expired by the time settlement opens (FLIP_TIMEOUT < SETTLE_DELAY).
+        if (pendingFlips[day] > 0) revert FlipsPending();
 
         address[] storage players = _players[day];
         uint256 end = r.cursor + maxPlayers;
@@ -584,6 +603,7 @@ contract Sherwood is IHooks, IUnlockCallback {
         }
         uint256 rollover = total - awarded - buyback;
         r.settled = true;
+        r.settledAt = uint64(block.timestamp);
         buybackReserve += buyback;
         uint256 today = currentDay();
         if (rollover > 0) pot[today] += rollover;
@@ -594,7 +614,7 @@ contract Sherwood is IHooks, IUnlockCallback {
     function claim(uint256 day) external {
         Result storage r = _results[day];
         if (!r.settled) revert NotSettled();
-        if (block.timestamp > (day + 1) * 1 days + CLAIM_WINDOW) revert ClaimWindowClosed();
+        if (block.timestamp > claimDeadline(day)) revert ClaimWindowClosed();
         uint256 amount;
         uint256 balance = IBalanceOf(Currency.unwrap(pfwa)).balanceOf(msg.sender);
         for (uint256 i; i < 3; ++i) {
@@ -613,6 +633,13 @@ contract Sherwood is IHooks, IUnlockCallback {
         emit PrizeClaimed(day, msg.sender, amount);
     }
 
+    /// Winners have CLAIM_WINDOW from the end of the day, or from settlement if that came later.
+    function claimDeadline(uint256 day) public view returns (uint256) {
+        uint256 dayEnd = (day + 1) * 1 days;
+        uint256 settledAt = _results[day].settledAt;
+        return (settledAt > dayEnd ? settledAt : dayEnd) + CLAIM_WINDOW;
+    }
+
     /// Referrers withdraw their prize shares any time.
     function claimReferral() external {
         uint256 amount = referralEarnings[msg.sender];
@@ -627,7 +654,7 @@ contract Sherwood is IHooks, IUnlockCallback {
     function sweepUnclaimed(uint256 day) external {
         Result storage r = _results[day];
         if (!r.settled || r.swept) revert NotSettled();
-        if (block.timestamp <= (day + 1) * 1 days + CLAIM_WINDOW) revert ClaimWindowOpen();
+        if (block.timestamp <= claimDeadline(day)) revert ClaimWindowOpen();
         r.swept = true;
         uint256 amount;
         for (uint256 i; i < 3; ++i) {
@@ -670,12 +697,10 @@ contract Sherwood is IHooks, IUnlockCallback {
     /// Reclaims the fee of a Dice request that was never revealed (after Dice's refund delay) into the buyback reserve.
     function refundDiceRequest(uint64 sequence) external {
         if (msg.sender != operator && msg.sender != owner) revert NotOperator();
-        uint256 before = address(this).balance;
-        dice.refundRequest(diceProvider, sequence);
-        buybackReserve += address(this).balance - before;
+        dice.refundRequest(diceProvider, sequence); // the refund arrives through receive()
     }
 
-    // ── Admin: who runs buybacks, and which pool they use. Nothing else. ───────
+    // ── Admin: who runs buybacks, and (once) which pool they use. Nothing else. ─
 
     function setOwner(address next) external onlyOwner {
         owner = next;
@@ -687,7 +712,9 @@ contract Sherwood is IHooks, IUnlockCallback {
         emit OperatorChanged(next);
     }
 
+    /// Set once, at launch: after that nobody can redirect the buyback reserve.
     function setBuybackPool(PoolKey calldata key) external onlyOwner {
+        if (Currency.unwrap(buybackPool.currency1) != address(0)) revert PoolAlreadySet();
         if (!key.currency0.isAddressZero() || Currency.unwrap(key.currency1) != Currency.unwrap(pfwa)) {
             revert BadBuybackPool();
         }
