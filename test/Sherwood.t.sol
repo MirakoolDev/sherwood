@@ -598,13 +598,14 @@ contract SherwoodTest is Test, Deployers {
 
     // ── Forfeits and referrals ──────────────────────────────────────────────
 
-    function test_winnerWhoSoldForfeitsAtSettlement() public {
+    function test_winnerWhoSoldEverythingForfeitsAtSettlement() public {
         uint256 day = _day();
         _buy(alice, 0.05 ether, Sherwood.Move.BUY); // #1
         _buy(bob, 0.02 ether, Sherwood.Move.BUY); // #2
         uint256 total = hook.pot(day);
-        vm.prank(alice);
-        pfwaToken.transfer(carol, 1); // alice no longer holds all of today's buys
+        vm.startPrank(alice);
+        pfwaToken.transfer(carol, pfwaToken.balanceOf(alice)); // alice sold all of today's buys
+        vm.stopPrank();
         vm.warp((day + 1) * 1 days + 15 minutes);
         uint256 todayBefore = hook.pot(day + 1);
         hook.settle(day, 100);
@@ -617,6 +618,58 @@ contract SherwoodTest is Test, Deployers {
         vm.prank(alice);
         vm.expectRevert(Sherwood.NothingToClaim.selector);
         hook.claim(day);
+    }
+
+    function test_winnerWhoSoldPartForfeitsThatShare() public {
+        uint256 day = _day();
+        _buy(alice, 0.05 ether, Sherwood.Move.BUY); // #1
+        _buy(bob, 0.02 ether, Sherwood.Move.BUY); // #2
+        uint256 total = hook.pot(day);
+        uint256 owed = hook.bought(day, alice);
+        uint256 sold = owed / 5;
+        vm.prank(alice);
+        pfwaToken.transfer(carol, sold); // sold 20% of today's buys
+        vm.warp((day + 1) * 1 days + 15 minutes);
+        uint256 todayBefore = hook.pot(day + 1);
+        hook.settle(day, 100);
+        (,,, uint256[3] memory prize,) = hook.result(day);
+        uint256 share = total * 50 / 100;
+        uint256 kept = share * (owed - sold) / owed;
+        assertEq(prize[0], kept);
+        assertApproxEqAbs(prize[0], share * 80 / 100, 1);
+        assertEq(prize[1], total * 20 / 100);
+        // the forfeited 20% of #1's prize rolls over with the rest
+        assertEq(hook.pot(day + 1) - todayBefore, total - kept - total * 20 / 100 - total * 10 / 100);
+
+        uint256 before = alice.balance;
+        vm.prank(alice);
+        hook.claim(day);
+        assertEq(alice.balance - before, kept);
+    }
+
+    function test_partialWinnerMustKeepWhatTheyHeldToClaim() public {
+        uint256 day = _day();
+        _buy(alice, 0.05 ether, Sherwood.Move.BUY);
+        uint256 owed = hook.bought(day, alice);
+        vm.prank(alice);
+        pfwaToken.transfer(carol, owed / 2); // sold half before settlement
+        vm.warp((day + 1) * 1 days + 15 minutes);
+        hook.settle(day, 100);
+
+        assertEq(hook.heldToClaim(day, alice), owed - owed / 2);
+        assertEq(hook.heldToClaim(day, bob), 0);
+        vm.prank(alice);
+        pfwaToken.transfer(carol, 1); // sold a little more after settlement
+        vm.prank(alice);
+        vm.expectRevert(Sherwood.MustHoldToClaim.selector);
+        hook.claim(day);
+
+        vm.prank(carol);
+        pfwaToken.transfer(alice, 1); // back to what she held at settlement
+        uint256 before = alice.balance;
+        vm.prank(alice);
+        hook.claim(day);
+        assertGt(alice.balance, before);
     }
 
     function test_referrerIsSetOnceAndNeverChanges() public {

@@ -26,8 +26,9 @@ one contract: [`src/Sherwood.sol`](src/Sherwood.sol).
   batches. Top 3 players with positive points take 50% / 20% / 10%; 10% goes to the buyback reserve (bought and
   burned through a separate holder pool by the operator); the rest rolls into the current day's pot.
 - **Holding rules**: the hook records the $PFWA each player buys per day (`bought`). A winner whose balance is
-  below that day's buys at settlement forfeits the prize into the next pot, and `claim` reverts until they hold
-  it again. Holding all of yesterday's buys gives +25% points today (`holderBonusActive`).
+  below that day's buys at settlement keeps only `prize * balance / bought` and forfeits the rest into the next
+  pot (sold 20%, lose 20%). The balance kept is recorded (`heldToClaim`), and `claim` reverts while the winner
+  holds less than that. Holding all of yesterday's buys gives +25% points today (`holderBonusActive`).
 - **Selling** $PFWA in this pool wipes the seller's positive points for the day.
 - **Referrals**: a player's referrer is set once, on their very first play, from hook data. Not self, not
   mutual. A referred player gets +10% points on their first day. On days the referrer also played: +10% of the
@@ -73,7 +74,7 @@ ownership to the admin wallet in one transaction. $PFWA liquidity is then added 
 
 1. Delta accounting in `beforeSwap` / `afterSwap` (fee take, return deltas, exact-input only) and the
    `unlockCallback` buyback path.
-2. Pot and prize accounting across `settle`, `claim`, `sweepUnclaimed`, forfeits, referral shares and
+2. Pot and prize accounting across `settle`, `claim`, `sweepUnclaimed`, partial forfeits, referral shares and
    `claimReferral`: total ETH paid out can never exceed ETH received.
 3. Flip lifecycle: request, callback, expiry, refunds, and the Dice fee taken from the pot.
 4. Points bookkeeping with negative scores, leader tracking, the last-10 list and settlement batching.
@@ -85,7 +86,7 @@ Foundry with solc 0.8.26 (via IR, cancun). Dependencies are vendored in `lib/`.
 
 ```
 forge build
-forge test --no-match-contract Fork              # 56 unit tests
+forge test --no-match-contract Fork              # 58 unit tests
 forge test --match-contract Fork                 # 3 tests against live Robinhood Chain state (needs the public RPC)
 ```
 

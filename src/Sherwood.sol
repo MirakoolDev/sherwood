@@ -86,8 +86,9 @@ contract Sherwood is IHooks, IUnlockCallback {
     }
 
     // ── Wiring ──────────────────────────────────────────────────────────────────
-    /// $PFWA each player bought through this pool, per day. A winner must still hold that day's
-    /// buys to claim, and holding yesterday's buys earns the holder bonus today.
+    /// $PFWA each player bought through this pool, per day. A winner keeps the share of the prize
+    /// matching the share of that day's buys they still hold, and holding yesterday's buys earns
+    /// the holder bonus today.
     mapping(uint256 day => mapping(address player => uint256)) public bought;
 
     /// Who referred each player. Set once, from the first play that names one, and never changed.
@@ -138,6 +139,7 @@ contract Sherwood is IHooks, IUnlockCallback {
         uint256[3] prize;
         bool[3] claimed;
         bool swept;
+        uint256[3] held; // $PFWA each winner must still hold to claim (what they held at settlement)
     }
 
     mapping(uint256 day => Result) internal _results;
@@ -556,17 +558,25 @@ contract Sherwood is IHooks, IUnlockCallback {
         for (uint256 i; i < 3; ++i) {
             address winner = r.top[i];
             if (winner == address(0)) continue;
-            // Sold that day's buys (in any pool) before settlement: the prize rolls into today's pot.
-            if (IBalanceOf(Currency.unwrap(pfwa)).balanceOf(winner) < bought[day][winner]) {
-                emit PrizeForfeited(day, winner, shares[i]);
-                continue;
+            // Sold part of that day's buys (in any pool) before settlement: the same share of the
+            // prize rolls into today's pot. Sold 20%, lose 20%.
+            uint256 prize = shares[i];
+            uint256 owed = bought[day][winner];
+            uint256 balance = IBalanceOf(Currency.unwrap(pfwa)).balanceOf(winner);
+            if (balance < owed) {
+                uint256 kept = (prize * balance) / owed;
+                emit PrizeForfeited(day, winner, prize - kept);
+                prize = kept;
+                owed = balance;
             }
-            r.prize[i] = shares[i];
-            awarded += shares[i];
-            // The referrer's share comes out of the rollover (always 10% or more), not the prize.
+            if (prize == 0) continue;
+            r.prize[i] = prize;
+            r.held[i] = owed;
+            awarded += prize;
+            // The referrer's share comes out of the rollover (always 6% or more), not the prize.
             address ref = referrerOf[winner];
             if (ref != address(0) && _joined[day][ref]) {
-                uint256 cut = (shares[i] * REFERRAL_PRIZE_BPS) / 10_000;
+                uint256 cut = (prize * REFERRAL_PRIZE_BPS) / 10_000;
                 referralEarnings[ref] += cut;
                 awarded += cut;
                 emit ReferralPrize(day, ref, winner, cut);
@@ -586,16 +596,18 @@ contract Sherwood is IHooks, IUnlockCallback {
         if (!r.settled) revert NotSettled();
         if (block.timestamp > (day + 1) * 1 days + CLAIM_WINDOW) revert ClaimWindowClosed();
         uint256 amount;
+        uint256 balance = IBalanceOf(Currency.unwrap(pfwa)).balanceOf(msg.sender);
         for (uint256 i; i < 3; ++i) {
             if (r.top[i] == msg.sender && !r.claimed[i] && r.prize[i] > 0) {
+                // Winners keep what they held at settlement until they claim. Sold more since, in
+                // this pool or anywhere else? The prize stays put and goes back to the pot after the
+                // claim window, unless they buy it back first.
+                if (balance < r.held[i]) revert MustHoldToClaim();
                 r.claimed[i] = true;
                 amount += r.prize[i];
             }
         }
         if (amount == 0) revert NothingToClaim();
-        // Winners keep the $PFWA they bought that day, at least until they claim. Sold it, in this
-        // pool or anywhere else? The prize stays put and goes back to the pot after the claim window.
-        if (IBalanceOf(Currency.unwrap(pfwa)).balanceOf(msg.sender) < bought[day][msg.sender]) revert MustHoldToClaim();
         (bool ok,) = msg.sender.call{value: amount}("");
         if (!ok) revert TransferFailed();
         emit PrizeClaimed(day, msg.sender, amount);
@@ -729,6 +741,15 @@ contract Sherwood is IHooks, IUnlockCallback {
     {
         Result storage r = _results[day];
         return (r.settled, r.top, r.topPoints, r.prize, r.claimed);
+    }
+
+    /// The $PFWA `player` must hold to claim their prize for `day`: what they held at settlement.
+    function heldToClaim(uint256 day, address player) external view returns (uint256) {
+        Result storage r = _results[day];
+        for (uint256 i; i < 3; ++i) {
+            if (r.top[i] == player && r.prize[i] > 0) return r.held[i];
+        }
+        return 0;
     }
 
     // ── Unused hook callbacks ───────────────────────────────────────────────────
