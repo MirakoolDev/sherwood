@@ -24,4 +24,7 @@ after it, and covered by a test in `test/Sherwood.t.sol`.
 | 8 | Low | A Dice refund triggered outside `refundDiceRequest` was dropped and stuck | **Fixed.** `receive()` credits any ETH from Dice to the buyback reserve | `test_diceRefundFromAnywhereGoesToBuybackReserve` |
 | 9 | Info | The owner could point the buyback at a pool with a hook that captures the ETH | **Fixed.** `setBuybackPool` can be called once (`PoolAlreadySet`). After launch nobody can redirect the reserve | `test_buybackPoolIsSetOnce` |
 
-The fixes are not re-audited.
+The fixes are not re-audited. For the high finding, the judge's own proof test from the report
+(`test_pointsFollowEthActuallySwappedNotAmountOffered`, run unchanged) fails on the audited commit with
+"points scored on ETH that never entered the pool: 100 > 5" and passes on the fixed code, where the
+price-limited buy reverts with `PartialFill()`.
