@@ -105,3 +105,58 @@ forge test --match-contract Fork                 # 3 tests against live Robinhoo
 ## License
 
 MIT
+
+## Sherwood v2
+
+[`src/SherwoodV2.sol`](src/SherwoodV2.sol) is the next version of the game, and it works with any token. Its first deployment is for $IMD, with $PFWA as the host token. The v1 game above keeps running unchanged.
+
+### What changed from v1
+
+- **Rounds:** rolling 20-hour rounds from `GENESIS` replace fixed UTC days, so the end of each round falls at a different hour every day.
+- **Moves:** 0 Buy, 1 Steal, 2 Robin Hood, 3 Flip, 4 Shield. Steal, Robin Hood and Flip use charges that stack:
+
+  | Move | Earn rate | Most you can bank |
+  |---|---|---|
+  | Steal | 1 every 10 minutes | 18 |
+  | Robin Hood | 1 every hour | 3 |
+  | Flip | 1 every 6h40m (3 a round) | 6 |
+
+  Banks are kept per wallet and carry across rounds. A new wallet starts with a full bank. A move with no charge left plays as a Buy.
+- **Shield:** every 0.025 ETH played in a round earns one charge, and a player holds at most one. Playing Shield raises a 30-minute shield. The next Steal or Robin Hood aimed at the shielded player is reflected, and the attacker pays.
+- **King of the Hill:** the player who held #1 for the longest in a round wins 8%.
+- **Split:**
+
+  | Share | Goes to |
+  |---|---|
+  | 40% / 20% / 10% | Top 3 |
+  | 8% | King of the Hill |
+  | 10% | Game token burn, through `buybackPool` |
+  | 7% | Host token burn, through `hostBuybackPool` |
+  | 5% | Rollover |
+
+  Empty prize slots roll over. Referral cuts come out of the rollover: at most 5% × 78% = 3.9% < 5%.
+- **Host token:** a game for another token buys and burns the host token ($PFWA) with its 7%. Holding at least `hostHolderMin` of the host token gives +10% points. When the host token is the game token, both features are off and the 7% joins the game token burn.
+- **Claims:** prizes are claimed within 7 days. `sweepUnclaimed` moves anything left into the pot of the live round.
+
+### Deploying without a salt
+
+A v4 hook needs its permission flags (`0x20CC`) in the low bits of its address. [`src/SherwoodV2Launcher.sol`](src/SherwoodV2Launcher.sol) is for factories that can't pass a CREATE2 salt. In its constructor it searches salts onchain and deploys the hook with CREATE2. That takes about 16k tries on average, and the whole deploy costs about 10M gas. Read the result from `launcher.hook()`.
+
+[`test/SherwoodV2LauncherFork.t.sol`](test/SherwoodV2LauncherFork.t.sol) rehearses the whole $IMD launch on a Robinhood Chain fork: deploy, owner setup, a play, settlement and both burns.
+
+### Owner setup after deploy
+
+[`script/SetupSherwoodV2.s.sol`](script/SetupSherwoodV2.s.sol) runs these steps as the owner:
+
+1. Create the ETH/$IMD game pool: fee 9000, tick spacing 180, hooks set to the hook, at the 1% pool's price.
+2. `setOperator(bot)`.
+3. `setBuybackPool(ETH/$IMD 1%)`.
+4. `setHostBuybackPool(ETH/$PFWA holder pool)`.
+
+### Where we would like the most scrutiny (v2)
+
+- **The two buyback swaps:** they share one `unlockCallback`, with a flag saying which burn it is. Slippage protection relies only on the operator's `minOut`.
+- **Pot accounting:** settlement must never revert, and ETH out can never exceed ETH in, across prizes, referral cuts, claims and sweeps.
+- **Charge clocks:** `_charges`, `_spend` and `_nextCharge`.
+- **King of the Hill reign tracking:** `_updateReign` and the bounded leader rescan.
+- **Host bonus:** it reads the balance at play time, so a player could borrow 100k $PFWA for one transaction. The edge is 10% of points, and the swap fees for borrowing it by buying and selling cost more.
