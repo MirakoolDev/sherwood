@@ -72,7 +72,7 @@ ownership to the admin wallet in one transaction. $PFWA liquidity is then added 
   dumping, they don't make it impossible.
 - Referral by a second wallet you control is possible; it only earns the 10% bonus points on days you play and
   5% of a prize from the rollover.
-- The leader is tracked incrementally and rescanned at most `MAX_LEADER_SCAN` players inside a swap.
+- The leader is tracked incrementally. A rescan of up to `MAX_LEADER_SCAN` players runs inside the swap that debited #1; a bigger board is rescanned in resumable chunks by the swaps that follow (see King of the Hill under Sherwood v2).
 - Robin Hood can pay the player making the move when they're the lowest of the last 10: robbing the leader for
   yourself is allowed, so moves can be chained.
 - Liquidity is one-sided $PFWA, so the pool price can't fall below its starting price.
@@ -122,8 +122,12 @@ MIT
   | Flip | 1 every 6h40m (3 a round) | 6 |
 
   Banks are kept per wallet and carry across rounds. A new wallet starts with a full bank. A move with no charge left plays as a Buy.
-- **Shield:** every 0.025 ETH played in a round earns one charge, and a player holds at most one. Playing Shield raises a 30-minute shield. The next Steal or Robin Hood aimed at the shielded player is reflected, and the attacker pays.
-- **King of the Hill:** the player who held #1 for the longest in a round wins 8%.
+- **Shield:** every 0.025 ETH played in a round earns one charge, and a player holds at most one. Playing Shield raises a 30-minute shield. The next Steal or Robin Hood aimed at the shielded player is reflected, and the attacker pays the whole cut the move would have taken, below zero if need be (like a lost flip). A move that would have taken nothing reflects nothing and leaves the shield up.
+- **King of the Hill:** the player who held #1 for the longest in a round wins 8%. When #1 loses points the board is rescanned for the new #1:
+  - Up to `MAX_LEADER_SCAN` (1,500) players, the move that debited #1 rescans the whole board at once (about 4.7k gas per player with cold storage: up to about 7.1M).
+  - On a bigger board, or when #1 loses a flip (Dice's reveal only has `FLIP_CALLBACK_GAS`, 200k, enough to rescan 12 players), #1 is unknown until the next play, sell or flip expiry rescans the board. Such a transaction rescans at least `LEADER_SCAN_CHUNK` (200) players, about 950k gas, and as many more as its gas allows while keeping `LEADER_SCAN_RESERVE` (1M) for the rest of the swap, so a caller who gives the swap gas to spare finishes a big board in one go; otherwise the following transactions carry on from where it stopped.
+  - While #1 is unknown nobody's clock runs and Robin Hood scores as a Buy and keeps its charge. Every point change restarts the unknown spell, so when the rescan completes the #1 it finds has held #1 for the whole spell and is credited back to its start. Seconds nobody is credited for go to nobody; the King is decided only by seconds actually observed at #1.
+- **Steal and Robin Hood with nothing to take:** a Steal with no previous player, or a Robin Hood with no leader or no other recent player, plays as a Buy and keeps its charge. A Steal or Robin Hood whose target exists but has no points above zero spends its charge and moves nothing: the move was made, there was just nothing to take.
 - **Split:**
 
   | Share | Goes to |
@@ -137,12 +141,17 @@ MIT
   Empty prize slots roll over. Referral cuts come out of the rollover: at most 5% × 78% = 3.9% < 5%.
 - **Host token:** a game for another token buys and burns the host token ($PFWA) with its 7%. Holding at least `hostHolderMin` of the host token gives +10% points. When the host token is the game token, both features are off and the 7% joins the game token burn.
 - **Claims:** prizes are claimed within 7 days. `sweepUnclaimed` moves anything left into the pot of the live round.
+- **Hook data:** `abi.encode(uint256 move)` or `abi.encode(uint256 move, address referrer)`. A move above 4 plays as a Buy; a referrer word that isn't a clean address is ignored. A swap never reverts over its hook data.
+- **Flips and the Dice fee:** the fee comes out of the pot. A flip only goes to Dice when the fee is at most `MAX_DICE_FEE` and at most the 5% its own buy paid in (so a flip never costs the pot more than the buy brought); otherwise the move scores as a Buy and keeps its charge.
+- **Seeding:** `fundPot(round)` takes the current round and up to 365 rounds ahead, so every seed can be settled out.
 
 ### Deploying without a salt
 
 A v4 hook needs its permission flags (`0x20CC`) in the low bits of its address. [`src/SherwoodV2Launcher.sol`](src/SherwoodV2Launcher.sol) is for factories that can't pass a CREATE2 salt. In its constructor it searches salts onchain and deploys the hook with CREATE2. That takes about 16k tries on average, and the whole deploy costs about 10M gas. Read the result from `launcher.hook()`.
 
 [`test/SherwoodV2LauncherFork.t.sol`](test/SherwoodV2LauncherFork.t.sol) rehearses the whole $IMD launch on a Robinhood Chain fork: deploy, owner setup, a play, settlement and both burns.
+
+The changes made for the $IMD launch, and the audit findings behind them, are listed in [ADAPTATION.md](ADAPTATION.md).
 
 ### Owner setup after deploy
 

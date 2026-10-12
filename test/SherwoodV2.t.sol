@@ -22,19 +22,35 @@ contract MockDiceV2 {
     }
     uint64 public nextSequence = 1;
     mapping(uint64 => address) public requester;
+    mapping(uint64 => uint32) public gasLimitOf;
 
     function getFeeV2(address, uint32) external view returns (uint128) {
         return fee;
     }
 
-    function requestV2(address, bytes32, uint32) external payable returns (uint64 sequence) {
+    function requestV2(address, bytes32, uint32 gasLimit) external payable returns (uint64 sequence) {
         require(msg.value >= fee, "fee");
         sequence = nextSequence++;
         requester[sequence] = msg.sender;
+        gasLimitOf[sequence] = gasLimit;
     }
 
+    /// Reveals the way Dice (Pyth Entropy) does: the callback gets exactly the gas limit the request
+    /// asked for, and a callback that fails is not applied (here: the reveal reverts).
     function reveal(uint64 sequence, bytes32 random) external {
-        SherwoodV2(payable(requester[sequence]))._entropyCallback(sequence, address(0), random);
+        (bool ok,) = requester[sequence].call{gas: gasLimitOf[sequence]}(
+            abi.encodeWithSelector(SherwoodV2._entropyCallback.selector, sequence, address(0), random)
+        );
+        require(ok, "callback failed within its gas limit");
+    }
+
+    /// Like `reveal`, but reports the outcome and the gas the callback used instead of reverting.
+    function tryReveal(uint64 sequence, bytes32 random) external returns (bool ok, uint256 gasUsed) {
+        uint256 before = gasleft();
+        (ok,) = requester[sequence].call{gas: gasLimitOf[sequence]}(
+            abi.encodeWithSelector(SherwoodV2._entropyCallback.selector, sequence, address(0), random)
+        );
+        gasUsed = before - gasleft();
     }
 
     function refundRequest(address, uint64 sequence) external {
@@ -84,7 +100,8 @@ contract Winner {
             while (true) {}
         }
         if (mode == Mode.REENTER) {
-            try hook.claim(round) {} catch {
+            try hook.claim(round) {}
+            catch {
                 reentryFailed = true;
             }
             try hook.settle(round, 100) {} catch {}
@@ -342,7 +359,8 @@ contract SherwoodV2Test is Test, Deployers {
         address hookAddr = address(FLAGS | (uint160(0x6161) << 144));
         _deployHook(hookAddr, START + 1 hours);
         SherwoodV2 late = SherwoodV2(payable(hookAddr));
-        PoolKey memory key = PoolKey(CurrencyLibrary.ADDRESS_ZERO, Currency.wrap(address(gameToken)), 3000, 60, IHooks(hookAddr));
+        PoolKey memory key =
+            PoolKey(CurrencyLibrary.ADDRESS_ZERO, Currency.wrap(address(gameToken)), 3000, 60, IHooks(hookAddr));
         vm.prank(owner);
         manager.initialize(key, SQRT_PRICE_1_1);
         _addLiquidity(key);
@@ -414,9 +432,9 @@ contract SherwoodV2Test is Test, Deployers {
     }
 
     function test_scaledBpsRange() public view {
-        assertEq(hook.scaledBps(hook.ROBIN_BPS_MIN(), hook.ROBIN_BPS_MAX(), 100), 3300);
-        assertEq(hook.scaledBps(hook.STEAL_BPS_MIN(), hook.STEAL_BPS_MAX(), 1), 2020);
-        assertEq(hook.scaledBps(hook.FLIP_WIN_BPS_MIN(), hook.FLIP_WIN_BPS_MAX(), 500), 30_000);
+        assertEq(hook.scaledBps(1000, 3300, 100), 3300);
+        assertEq(hook.scaledBps(2000, 4000, 1), 2020);
+        assertEq(hook.scaledBps(20_000, 30_000, 500), 30_000);
     }
 
     function test_stealOnYourselfDoesNothingExtra() public {
@@ -736,16 +754,47 @@ contract SherwoodV2Test is Test, Deployers {
         assertEq(hook.stealsLeft(bob), 17); // still used a steal
     }
 
-    function test_reflectedStealCappedAtAttackersPoints() public {
+    function test_reflectedStealTakesTheFullCutBelowZero() public {
         _buy(alice, 0.05 ether, SherwoodV2.Move.SHIELD); // alice 50, shielded
-        _buy(bob, 0.01 ether, SherwoodV2.Move.STEAL); // bob 10; would take 11, pays only his 10
-        assertEq(hook.points(0, bob), 0);
-        assertEq(hook.points(0, alice), 60);
+        _buy(bob, 0.01 ether, SherwoodV2.Move.STEAL); // bob 10; would take 11, pays all 11 like a lost flip
+        assertEq(hook.points(0, bob), -1);
+        assertEq(hook.points(0, alice), 61);
         assertFalse(hook.shieldActive(alice));
         // The shield is gone: the next steal lands.
-        _buy(alice, 0.001 ether, SherwoodV2.Move.BUY); // alice 61, previous
-        _buy(carol, 0.01 ether, SherwoodV2.Move.STEAL); // 22% of 61 = 13
-        assertEq(hook.points(0, alice), 48);
+        _buy(alice, 0.001 ether, SherwoodV2.Move.BUY); // alice 62, previous
+        _buy(carol, 0.01 ether, SherwoodV2.Move.STEAL); // 22% of 62 = 13
+        assertEq(hook.points(0, alice), 49);
+    }
+
+    /// Audit (low): a fresh wallet with one point could strip the leader's shield for 0.001 ETH because the
+    /// reflect was capped at the attacker's points. Now the attacker pays the whole cut the move would
+    /// have taken, so the shield pays the defender exactly what the attack would have cost them.
+    function test_throwawayWalletPaysTheFullCutToBreakAShield() public {
+        address mallory = makeAddr("mallory");
+        _buy(alice, 0.1 ether, SherwoodV2.Move.SHIELD); // alice 100, #1, shielded
+        _buy(bob, 0.002 ether, SherwoodV2.Move.BUY); // bob 2: someone a Robin Hood could pay
+        _buy(mallory, 0.001 ether, SherwoodV2.Move.ROBIN_HOOD); // mallory 1; the 10% cut (10) is reflected
+        assertEq(hook.points(0, alice), 110);
+        assertEq(hook.points(0, mallory), -9);
+        assertFalse(hook.shieldActive(alice)); // the shield did its job and broke
+        _buy(bob, 0.1 ether, SherwoodV2.Move.ROBIN_HOOD); // bob 102; 33% of 110 = 36 to the lowest recent (mallory)
+        assertEq(hook.points(0, alice), 74);
+        assertEq(hook.points(0, mallory), 27);
+        assertEq(hook.points(0, bob), 102);
+    }
+
+    /// Audit (low): a Steal on a shielded previous player with nothing to take used to delete the shield.
+    function test_stealThatTakesNothingLeavesTheShieldUp() public {
+        _buy(alice, 0.05 ether, SherwoodV2.Move.SHIELD); // alice 50, shielded
+        _sell(alice, 0.001 ether); // wiped to 0, still the previous player
+        assertEq(hook.lastPlayer(0), alice);
+        assertEq(hook.points(0, alice), 0);
+        assertTrue(hook.shieldActive(alice));
+        _buy(bob, 0.01 ether, SherwoodV2.Move.STEAL); // 22% of 0 = 0: nothing reflected, nothing broken
+        assertEq(hook.points(0, bob), 10);
+        assertEq(hook.points(0, alice), 0);
+        assertTrue(hook.shieldActive(alice));
+        assertEq(hook.stealsLeft(bob), 17); // the steal was still played
     }
 
     function test_robinHoodIntoShieldIsReflected() public {
@@ -762,12 +811,12 @@ contract SherwoodV2Test is Test, Deployers {
         assertEq(hook.robinsLeft(carol), 2);
     }
 
-    function test_reflectedRobinHoodCappedAtRobbersPoints() public {
+    function test_reflectedRobinHoodTakesTheFullCutBelowZero() public {
         _buy(alice, 0.1 ether, SherwoodV2.Move.SHIELD); // alice 100, shielded
         _buy(bob, 0.002 ether, SherwoodV2.Move.BUY);
-        _buy(carol, 0.01 ether, SherwoodV2.Move.ROBIN_HOOD); // carol 10, cut 12 → pays 10
-        assertEq(hook.points(0, carol), 0);
-        assertEq(hook.points(0, alice), 110);
+        _buy(carol, 0.01 ether, SherwoodV2.Move.ROBIN_HOOD); // carol 10, cut 12 → pays all 12
+        assertEq(hook.points(0, carol), -2);
+        assertEq(hook.points(0, alice), 112);
         assertEq(hook.points(0, bob), 2);
         assertEq(hook.shieldUntil(alice), 0);
     }
@@ -993,7 +1042,7 @@ contract SherwoodV2Test is Test, Deployers {
         );
         // The rollover covers the largest possible referral cut: 5% of all four prizes.
         uint256 prizes = hook.FIRST_BPS() + hook.SECOND_BPS() + hook.THIRD_BPS() + hook.KING_BPS();
-        assertLe(prizes * hook.REFERRAL_PRIZE_BPS() / 10_000, hook.ROLLOVER_BPS());
+        assertLe(prizes * 500 / 10_000, hook.ROLLOVER_BPS());
     }
 
     function test_settleSplitsPotAndWinnersClaim() public {
@@ -1033,7 +1082,10 @@ contract SherwoodV2Test is Test, Deployers {
         assertEq(kingPrize, _bps(total, 800));
         assertTrue(!claimed[0] && !claimed[1] && !claimed[2] && !kingClaimed);
         assertEq(hook.buybackReserve(), _bps(total, 1000));
-        assertEq(hook.pot(round + 1), total - prize[0] - prize[1] - prize[2] - kingPrize - _bps(total, 1000) - _bps(total, 700));
+        assertEq(
+            hook.pot(round + 1),
+            total - prize[0] - prize[1] - prize[2] - kingPrize - _bps(total, 1000) - _bps(total, 700)
+        );
         assertApproxEqAbs(hook.pot(round + 1), _bps(total, 500), 5);
         assertEq(hook.hostBuybackReserve(), _bps(total, 700));
 
@@ -1193,7 +1245,9 @@ contract SherwoodV2Test is Test, Deployers {
         vm.warp(_settleTime(round));
         hook.settle(round, 100);
         // alice 40% + King 8%, buyback 10%, host buyback 7%, the rest (35%) rolls into the next round
-        assertEq(hook.pot(round + 1), total - _bps(total, 4000) - _bps(total, 800) - _bps(total, 1000) - _bps(total, 700));
+        assertEq(
+            hook.pot(round + 1), total - _bps(total, 4000) - _bps(total, 800) - _bps(total, 1000) - _bps(total, 700)
+        );
     }
 
     function test_noKingShareRollsOver() public {
@@ -1310,8 +1364,7 @@ contract SherwoodV2Test is Test, Deployers {
         vm.warp(_settleTime(round));
         uint256 before = alice.balance;
         hook.settle(round, 100);
-        (, address[3] memory top,,,, address s, uint256 reign, uint256 kingPrize, bool kingClaimed) =
-            hook.result(round);
+        (, address[3] memory top,,,, address s, uint256 reign, uint256 kingPrize, bool kingClaimed) = hook.result(round);
         assertEq(top[0], bob);
         assertEq(top[1], carol);
         assertEq(top[2], dave);
@@ -1420,7 +1473,8 @@ contract SherwoodV2Test is Test, Deployers {
         assertEq(kingPrize, keptKing);
         assertEq(prize[0], _bps(total, 4000)); // bob kept everything
         assertEq(
-            hook.pot(round + 1) - nextBefore, total - _bps(total, 4000) - keptRank - keptKing - _bps(total, 1000) - _bps(total, 700)
+            hook.pot(round + 1) - nextBefore,
+            total - _bps(total, 4000) - keptRank - keptKing - _bps(total, 1000) - _bps(total, 700)
         );
         assertEq(hook.heldToClaim(round, alice), owed - sold); // what she held at settlement
         uint256 aliceBefore = alice.balance;
@@ -1552,13 +1606,17 @@ contract SherwoodV2Test is Test, Deployers {
         assertEq(r.length, 3);
         assertEq(r[0], carol);
         assertEq(r[2], alice);
-        for (uint256 i; i < 12; ++i) _buy(dave, 0.001 ether, SherwoodV2.Move.BUY);
+        for (uint256 i; i < 12; ++i) {
+            _buy(dave, 0.001 ether, SherwoodV2.Move.BUY);
+        }
         assertEq(hook.recentPlayers(_round()).length, 10);
     }
 
     function test_onlyOneGamePool() public {
         vm.expectRevert();
-        initPool(CurrencyLibrary.ADDRESS_ZERO, Currency.wrap(address(gameToken)), IHooks(address(hook)), 500, SQRT_PRICE_1_1);
+        initPool(
+            CurrencyLibrary.ADDRESS_ZERO, Currency.wrap(address(gameToken)), IHooks(address(hook)), 500, SQRT_PRICE_1_1
+        );
     }
 
     function test_fundPotSeedsCurrentAndFutureRounds() public {
@@ -1570,6 +1628,58 @@ contract SherwoodV2Test is Test, Deployers {
         vm.warp(vm.getBlockTimestamp() + 20 hours);
         vm.expectRevert(SherwoodV2.RoundPassed.selector);
         hook.fundPot{value: 1}(round);
+    }
+
+    /// Review (low): a round too far ahead could never be settled, stranding its seed.
+    function test_fundPotRejectsRoundsTooFarAhead() public {
+        uint256 round = _round();
+        hook.fundPot{value: 1}(round + 365);
+        assertEq(hook.pot(round + 365), 1);
+        vm.expectRevert(SherwoodV2.RoundPassed.selector);
+        hook.fundPot{value: 1}(round + 366);
+        vm.expectRevert(SherwoodV2.RoundPassed.selector);
+        hook.fundPot{value: 1}(type(uint256).max);
+    }
+
+    /// Review (low): `settle(round, type(uint256).max)` means "all remaining" and must not overflow.
+    function test_settleAllRemainingWithMax() public {
+        uint256 round = _round();
+        _buy(alice, 0.01 ether, SherwoodV2.Move.BUY);
+        _buy(bob, 0.01 ether, SherwoodV2.Move.BUY);
+        vm.warp(_settleTime(round) + 1);
+        assertFalse(hook.settle(round, 1));
+        assertTrue(hook.settle(round, type(uint256).max));
+        (bool settled, address[3] memory top,,,,,,,) = hook.result(round);
+        assertTrue(settled);
+        assertEq(top[0], alice);
+        assertEq(top[1], bob);
+    }
+
+    /// Review (low): a referrer word that isn't a clean address is ignored; the swap never reverts over it.
+    function test_dirtyReferrerWordIsIgnoredNotAReasonToRevert() public {
+        _swapIn(gameKey, alice, 0.01 ether, abi.encode(uint256(0), bytes32(uint256(1) << 200)));
+        assertEq(hook.points(_round(), alice), 10);
+        assertEq(hook.referrerOf(alice), address(0));
+        // A clean referrer in the same slot still works.
+        _buyRef(bob, 0.01 ether, SherwoodV2.Move.BUY, carol);
+        assertEq(hook.referrerOf(bob), carol);
+    }
+
+    /// Review (low): a flip never costs the pot more than its own buy paid in. At a Dice fee above the
+    /// buy's 5% the move scores as a buy and keeps its flip charge.
+    function test_flipScoresAsBuyWhenDiceFeeExceedsTheBuysPotShare() public {
+        uint256 round = _round();
+        hook.fundPot{value: 0.01 ether}(round);
+        dice.setFee(0.0005 ether); // = MAX_DICE_FEE, so only the new bound applies
+        uint256 before = hook.pot(round);
+        _buy(alice, 0.001 ether, SherwoodV2.Move.FLIP); // pays 0.00005 ETH in; the fee would take 0.0005
+        assertEq(hook.pot(round), before + 0.00005 ether, "the pot never shrinks because of a buy");
+        assertEq(hook.points(round, alice), 1);
+        assertEq(hook.pendingFlips(round), 0);
+        assertEq(hook.flipsLeft(alice), 6);
+        // A buy whose 5% covers the fee still flips.
+        _buy(bob, 0.01 ether, SherwoodV2.Move.FLIP); // 0.0005 ETH in
+        assertEq(hook.pendingFlips(round), 1);
     }
 
     function test_plainEthTransferLandsInCurrentPot() public {
@@ -1869,7 +1979,8 @@ contract SherwoodV2Test is Test, Deployers {
         assertEq(prize[1], _bps(total, 2000));
         // the forfeited 20% of alice's prizes rolls over with the rest
         assertEq(
-            hook.pot(round + 1) - nextBefore, total - kept - keptKing - _bps(total, 2000) - _bps(total, 1000) - _bps(total, 700)
+            hook.pot(round + 1) - nextBefore,
+            total - kept - keptKing - _bps(total, 2000) - _bps(total, 1000) - _bps(total, 700)
         );
         uint256 aliceBefore = alice.balance;
         vm.prank(alice);
@@ -1955,7 +2066,8 @@ contract SherwoodV2Test is Test, Deployers {
         // #1 40% + #2 20% + King 8% awarded in full; 10% + 7% host buyback; empty #3 + rollover, minus carol's cut, roll on
         assertEq(
             hook.pot(round + 1) - before,
-            total - _bps(total, 4000) - _bps(total, 2000) - _bps(total, 800) - _bps(total, 1000) - _bps(total, 700) - cut
+            total - _bps(total, 4000) - _bps(total, 2000) - _bps(total, 800) - _bps(total, 1000) - _bps(total, 700)
+                - cut
         );
     }
 
@@ -1999,7 +2111,8 @@ contract SherwoodV2Test is Test, Deployers {
     function test_onlyTheOwnerCanCreateThePool() public {
         address hookAddr = address(FLAGS | (uint160(0x5151) << 144));
         _deployHook(hookAddr, GENESIS);
-        PoolKey memory key = PoolKey(CurrencyLibrary.ADDRESS_ZERO, Currency.wrap(address(gameToken)), 500, 10, IHooks(hookAddr));
+        PoolKey memory key =
+            PoolKey(CurrencyLibrary.ADDRESS_ZERO, Currency.wrap(address(gameToken)), 500, 10, IHooks(hookAddr));
         vm.prank(alice);
         vm.expectRevert();
         manager.initialize(key, SQRT_PRICE_1_1);
@@ -2010,7 +2123,9 @@ contract SherwoodV2Test is Test, Deployers {
 
     function test_samePermissionsAsV1() public view {
         Hooks.Permissions memory p = hook.getHookPermissions();
-        assertTrue(p.beforeInitialize && p.beforeSwap && p.afterSwap && p.beforeSwapReturnDelta && p.afterSwapReturnDelta);
+        assertTrue(
+            p.beforeInitialize && p.beforeSwap && p.afterSwap && p.beforeSwapReturnDelta && p.afterSwapReturnDelta
+        );
         assertFalse(p.afterInitialize || p.beforeAddLiquidity || p.afterAddLiquidity || p.beforeRemoveLiquidity);
         assertFalse(p.afterRemoveLiquidity || p.beforeDonate || p.afterDonate);
         assertFalse(p.afterAddLiquidityReturnDelta || p.afterRemoveLiquidityReturnDelta);
@@ -2025,7 +2140,6 @@ contract SherwoodV2Test is Test, Deployers {
         assertEq(Currency.unwrap(hook.host()), address(hostToken));
         assertEq(hook.hostHolderMin(), HOST_MIN);
         assertTrue(hook.hostEnabled());
-        assertEq(hook.HOST_BONUS_BPS(), 11_000);
     }
 
     function test_hostBurnReserveAccruesSevenPercent() public {
@@ -2239,6 +2353,139 @@ contract SherwoodV2Test is Test, Deployers {
             address(hook).balance,
             prizes + cuts + hook.buybackReserve() + hook.hostBuybackReserve() + hook.pot(round + 1)
         );
+    }
+
+    // ── Dice callback gas (audit: high) ─────────────────────────────────────
+
+    function _fillBoard(uint256 n) internal {
+        for (uint256 i; i < n; ++i) {
+            _buy(address(uint160(0x1000 + i)), 0.001 ether, SherwoodV2.Move.BUY);
+        }
+    }
+
+    /// Audit (high): a lost flip by #1 marks the cached leader stale, and the callback used to rescan the
+    /// whole board inside FLIP_CALLBACK_GAS. With 20+ players Dice dropped the reveal, and the leader's
+    /// loss became a refund at expiry. A big board now closes the reign in the callback and leaves the
+    /// rescan to the next play, which runs with its caller's gas.
+    function test_leaderLostFlipCallbackFitsDiceGasLimitOnABigBoard() public {
+        uint256 t0 = vm.getBlockTimestamp();
+        _buy(alice, 0.1 ether, SherwoodV2.Move.BUY); // alice 100, #1
+        _fillBoard(200);
+        _buy(bob, 0.002 ether, SherwoodV2.Move.BUY); // bob 2, the previous player a loss pays
+        _buy(alice, 0.05 ether, SherwoodV2.Move.FLIP); // stake 50, sequence 1
+        assertEq(hook.pendingFlips(0), 1);
+        vm.warp(t0 + 60);
+        vm.cool(address(hook)); // the reveal is its own transaction: every slot it reads is cold
+        (bool ok, uint256 gasUsed) = dice.tryReveal(1, bytes32(uint256(1))); // odd: a loss
+        emit log_named_uint("leader loss on 202 players, callback gas", gasUsed);
+        assertTrue(ok, "the callback must fit FLIP_CALLBACK_GAS");
+        assertLt(gasUsed, 200_000);
+        assertEq(hook.points(0, alice), 50);
+        assertEq(hook.points(0, bob), 52);
+        assertEq(hook.pendingFlips(0), 0);
+        // The reign was closed at the reveal: alice keeps the 60 seconds she really held #1 and #1 is
+        // unknown until the board is rescanned.
+        assertEq(hook.reignHolder(0), address(1));
+        assertEq(hook.reignOf(0, alice), 60);
+        // The next play rescans first (bob is #1 with 52). Nothing changed since the reveal, so bob has
+        // held #1 since then and his reign is credited back to it.
+        vm.warp(t0 + 120);
+        _buy(carol, 0.001 ether, SherwoodV2.Move.BUY);
+        assertEq(hook.leader(0), bob);
+        assertEq(hook.reignHolder(0), bob);
+        vm.warp(t0 + 130);
+        assertEq(hook.reignOf(0, bob), 70);
+        assertEq(hook.reignOf(0, alice), 60);
+        // The flip is resolved: it can't be expired into a refund any more.
+        vm.warp(t0 + 11 minutes);
+        vm.expectRevert(SherwoodV2.FlipNotExpired.selector);
+        hook.expireFlip(1);
+    }
+
+    /// The same loss on a board of MAX_CALLBACK_SCAN players is rescanned inside the callback, so the
+    /// new #1 is found right away and no reign time is lost.
+    function test_leaderLostFlipRescansASmallBoardInsideTheCallback() public {
+        uint256 t0 = vm.getBlockTimestamp();
+        _buy(alice, 0.1 ether, SherwoodV2.Move.BUY); // alice 100, #1
+        _buy(carol, 0.06 ether, SherwoodV2.Move.BUY); // carol 60
+        _fillBoard(9); // 12 players once bob joins
+        _buy(bob, 0.002 ether, SherwoodV2.Move.BUY); // bob 2, previous
+        _buy(alice, 0.05 ether, SherwoodV2.Move.FLIP); // stake 50
+        assertEq(hook.playerCount(0), 12);
+        vm.warp(t0 + 60);
+        vm.cool(address(hook));
+        (bool ok, uint256 gasUsed) = dice.tryReveal(1, bytes32(uint256(1)));
+        emit log_named_uint("leader loss on 12 players, callback gas", gasUsed);
+        assertTrue(ok);
+        assertLt(gasUsed, 200_000);
+        assertEq(hook.points(0, alice), 50);
+        assertEq(hook.points(0, bob), 52);
+        assertEq(hook.leader(0), carol); // the rescan corrected the cache (bob was credited above alice)
+        assertEq(hook.reignHolder(0), carol);
+        assertEq(hook.reignOf(0, alice), 60);
+        vm.warp(t0 + 70);
+        assertEq(hook.reignOf(0, carol), 10);
+    }
+
+    /// One player past the bound: the callback defers the rescan instead of running out of gas.
+    function test_leaderLostFlipDefersTheRescanJustPastTheBound() public {
+        _buy(alice, 0.1 ether, SherwoodV2.Move.BUY);
+        _buy(carol, 0.06 ether, SherwoodV2.Move.BUY);
+        _fillBoard(10); // 13 players once bob joins
+        _buy(bob, 0.002 ether, SherwoodV2.Move.BUY);
+        _buy(alice, 0.05 ether, SherwoodV2.Move.FLIP);
+        assertEq(hook.playerCount(0), 13);
+        vm.cool(address(hook));
+        (bool ok, uint256 gasUsed) = dice.tryReveal(1, bytes32(uint256(1)));
+        emit log_named_uint("leader loss on 13 players, callback gas", gasUsed);
+        assertTrue(ok);
+        assertLt(gasUsed, 200_000);
+        assertEq(hook.reignHolder(0), address(1)); // #1 unknown until the next play rescans and credits them back to here
+        assertEq(hook.points(0, alice), 50);
+        assertEq(hook.points(0, bob), 52);
+    }
+
+    /// #1 loses a flip on a board of more than 12 players and nobody plays again before the round ends:
+    /// the rescan never runs, so settlement credits the unknown spell to the final #1.
+    function test_settleCreditsTheFinalUnknownSpellToTheFinalLeader() public {
+        uint256 start = vm.getBlockTimestamp();
+        _buy(alice, 0.1 ether, SherwoodV2.Move.BUY); // alice 100, #1
+        _buy(carol, 0.06 ether, SherwoodV2.Move.BUY); // carol 60
+        _fillBoard(10);
+        _buy(bob, 0.002 ether, SherwoodV2.Move.BUY);
+        vm.warp(start + 1 hours);
+        _buy(alice, 0.05 ether, SherwoodV2.Move.FLIP);
+        dice.reveal(1, bytes32(uint256(1))); // alice loses 50: carol is #1, but nobody knows until a rescan
+        uint256 spellStart = vm.getBlockTimestamp();
+        assertEq(hook.reignHolder(0), address(1));
+        assertEq(hook.points(0, alice), 50);
+
+        vm.warp(_settleTime(0)); // no play after the reveal
+        hook.settle(0, type(uint256).max);
+        (,,,,, address king, uint256 kingReign,,) = hook.result(0);
+        assertEq(king, carol);
+        assertEq(kingReign, hook.roundEnd(0) - spellStart);
+        assertEq(kingReign, hook.reignOf(0, carol));
+        assertEq(hook.reignOf(0, alice), spellStart - start);
+        assertEq(hook.reignHolder(0), carol);
+    }
+
+    /// The other callback paths on a big, cold board: a non-leader's loss, and a win that takes #1.
+    function test_otherFlipOutcomesFitDiceGasLimitOnABigBoard() public {
+        _buy(alice, 0.1 ether, SherwoodV2.Move.BUY);
+        _fillBoard(200);
+        _buy(bob, 0.05 ether, SherwoodV2.Move.FLIP); // sequence 1: bob is not #1
+        _buy(carol, 0.1 ether, SherwoodV2.Move.FLIP); // sequence 2: a win makes carol #1
+        vm.cool(address(hook));
+        (bool ok, uint256 gasUsed) = dice.tryReveal(1, bytes32(uint256(1)));
+        emit log_named_uint("non-leader loss, callback gas", gasUsed);
+        assertTrue(ok);
+        vm.cool(address(hook));
+        (ok, gasUsed) = dice.tryReveal(2, bytes32(uint256(2)));
+        emit log_named_uint("win taking #1, callback gas", gasUsed);
+        assertTrue(ok);
+        assertEq(hook.points(0, carol), 300);
+        assertEq(hook.reignHolder(0), carol);
     }
 
     // ── Gas notes ───────────────────────────────────────────────────────────

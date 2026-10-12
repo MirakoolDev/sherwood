@@ -36,7 +36,12 @@ contract SherwoodV2LauncherForkTest is Test {
     );
 
     function setUp() public {
-        vm.createSelectFork("robinhood");
+        string memory rpc = vm.envOr("SHERWOOD_FORK_RPC_URL", string(""));
+        if (bytes(rpc).length == 0) {
+            vm.skip(true);
+            return;
+        }
+        vm.createSelectFork(rpc);
     }
 
     function test_forkLauncher_imdLaunchEndToEnd() public {
@@ -53,9 +58,12 @@ contract SherwoodV2LauncherForkTest is Test {
         assertTrue(game.hostEnabled());
 
         // Owner setup, as SetupSherwoodV2 does it.
-        PoolKey memory burnKey = PoolKey(CurrencyLibrary.ADDRESS_ZERO, Currency.wrap(IMD), 10_000, 100, IHooks(address(0)));
-        PoolKey memory hostKey = PoolKey(CurrencyLibrary.ADDRESS_ZERO, Currency.wrap(PFWA), 0x800000, 200, IHooks(HOLDER_HOOK));
-        PoolKey memory key = PoolKey(CurrencyLibrary.ADDRESS_ZERO, Currency.wrap(IMD), 9_000, 180, IHooks(address(game)));
+        PoolKey memory burnKey =
+            PoolKey(CurrencyLibrary.ADDRESS_ZERO, Currency.wrap(IMD), 10_000, 100, IHooks(address(0)));
+        PoolKey memory hostKey =
+            PoolKey(CurrencyLibrary.ADDRESS_ZERO, Currency.wrap(PFWA), 0x800000, 200, IHooks(HOLDER_HOOK));
+        PoolKey memory key =
+            PoolKey(CurrencyLibrary.ADDRESS_ZERO, Currency.wrap(IMD), 9_000, 180, IHooks(address(game)));
         (uint160 price, int24 tick,,) = MANAGER.getSlot0(burnKey.toId());
         assertGt(price, 0);
         vm.startPrank(ADMIN);

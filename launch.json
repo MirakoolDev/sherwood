@@ -1,0 +1,19 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "SherwoodV2Launcher",
+      "constructorArgs": [
+        "0x8366a39cc670b4001a1121b8f6a443a643e40951",
+        "0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127",
+        "0xa934ba4f59070149d37a93f8a002af79bae35563",
+        "100000000000000000000000",
+        "0xd8a0680e7699526b57140ed4eafdcc7219dc0a0c",
+        "0x8741b8a825644d9ef18faf2dab5e9b47b900f2b6",
+        "$owner",
+        "1791835200"
+      ]
+    }
+  ],
+  "notes": "Sherwood v2 on Robinhood Chain (4663) for the existing $IMD token. No new token, pool, distributor, ETH funding or initialization call: this manifest deploys exactly one contract, src/SherwoodV2Launcher.sol:SherwoodV2Launcher. A Uniswap v4 hook must carry its permission flags in the low 14 bits of its address and this launch takes no salt, so the launcher's constructor mines the first CREATE2 salt (from its own address, up to 400000 tries, about one in 16384 matches) whose address carries flags 0x20CC (beforeInitialize, beforeSwap, afterSwap, beforeSwapReturnDelta, afterSwapReturnDelta), then deploys src/SherwoodV2.sol:SherwoodV2 there with CREATE2 and reverts with NoSalt if the create fails. Mining and hook deployment together cost about 10M gas, rehearsed on a fork in test/SherwoodV2LauncherFork.t.sol. The game is launcher.hook() and the salt used is launcher.salt(). Neither constructor calls another contract (the launcher only hashes and creates; the hook stores its arguments and validates its own address flags with the Hooks library), so the empty-chain rehearsal passes; the launcher's runtime is small and uses no DELEGATECALL, CALLCODE or SELFDESTRUCT. The launcher's eight parameters are the hook's eight constructor parameters, same order, as plain address and uint256 types, and are forwarded unchanged: poolManager, the Uniswap v4 PoolManager on Robinhood Chain, 0x8366a39cc670b4001a1121b8f6a443a643e40951; token, $IMD, 0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127; host, $PFWA, 0xa934ba4f59070149d37a93f8a002af79bae35563; hostHolderMin 100000000000000000000000 (100000 PFWA in wei, the balance that earns the host-holder bonus); dice, the Dice Protocol entropy contract, 0xd8a0680e7699526b57140ed4eafdcc7219dc0a0c; diceProvider 0x8741b8a825644d9ef18faf2dab5e9b47b900f2b6; owner $owner, the wallet that paid for the launch, stored by the hook as both owner and initial operator (never the factory or tx.origin); genesis 1791835200, the unix time round 0 opens, with rounds rolling every 20 hours from it. Game rules and split are unchanged from the brief: one native-ETH/$IMD pool, every buy scores points and pays 5% of its ETH into the round's pot; moves are Buy, Steal, Robin Hood, Flip (Dice randomness) and Shield with stacking charges; each pot pays the top 3 40/20/10%, 8% to the King of the Hill, 10% buys back and burns $IMD through the existing ETH/$IMD 1% pool, 7% buys back and burns $PFWA through its holder pool, and 5% rolls over; prizes are claimable for 7 days and unclaimed prizes are swept into the live round's pot. After deployment the owner initializes the game pool against launcher.hook() and sets the two buyback pools with setBuybackPool and setHostBuybackPool, and may later hand over with setOwner and setOperator; those are owner actions outside this manifest."
+}
