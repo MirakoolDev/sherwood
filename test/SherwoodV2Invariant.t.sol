@@ -14,7 +14,6 @@ contract SherwoodV2InvariantTest is SherwoodV2Fixture {
 
     function setUp() public override {
         super.setUp();
-        _configureBurns();
         handler = new SherwoodV2Handler(game, dice, router, gameToken, hostToken, gameKey);
         hostToken.mint(handler.actors(0), HOST_MIN);
         // Start with active referrals, outstanding prizes, both burn reserves, and an expired request.

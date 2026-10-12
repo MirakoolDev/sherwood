@@ -44,7 +44,7 @@ one contract: [`src/Sherwood.sol`](src/Sherwood.sol).
 
 | Role | Can | Cannot |
 | --- | --- | --- |
-| Owner | `setOwner`, `setOperator`; set the buyback pool (once) and create the game pool (once) | Touch the pot, points, prizes, referral earnings or rules; change the buyback pool |
+| Owner | `setOwner` (names the next owner, who takes over with `acceptOwner`), `setOperator`; create the game pool (once) | Touch the pot, points, prizes, referral earnings or rules; choose or change the burn pools, which are fixed at deployment |
 | Operator (and owner) | `buybackAndBurn(amount, minPfwaOut)` from the buyback reserve; `refundDiceRequest` | Send reserve ETH anywhere but the buyback swap in the pool set at launch; $PFWA bought goes to the dead address. `minPfwaOut` is the operator's choice (the upkeep job uses a live quote) |
 | Anyone | Trade, `settle`, `sweepUnclaimed`, `fundPot`, `expireFlip` (after 10 minutes), add liquidity | — |
 
@@ -55,8 +55,12 @@ Rules are constants; there is no upgrade path.
 - Uniswap v4 PoolManager on Robinhood Chain `0x8366a39CC670B4001A1121B8F6A443A643e40951`.
 - Dice Protocol entropy `0xd8A0680e7699526B57140ED4EAfdCc7219Dc0A0c`, provider `0x8741b8a825644D9Ef18Faf2DAB5e9b47B900F2b6`.
 - $PFWA `0xa934bA4F59070149d37A93F8A002Af79BAe35563` (standard ERC-20).
-- The buyback pool: the $PFWA holder pool, an existing ETH/$PFWA pool with another hook, set once at launch. If it
-  ever stops working, the buyback reserve stays in the contract.
+- The burn pools, fixed in the hook at deployment (`buybackPool()` and `hostBuybackPool()`): the game token's
+  burn goes through the existing ETH/token 1% pool (fee 10000, tick spacing 100, no hook), the host burn through
+  the $PFWA holder pool, an existing ETH/$PFWA pool with Hookr's holder hook
+  `0xb914f955294799de4b891bd2EA8AF628Fa1c68CC` (dynamic fee, tick spacing 200). In $PFWA's own game the one
+  burn goes through the holder pool. Nobody can point a reserve anywhere else; if a pool ever stops working,
+  its reserve stays in the contract.
 
 ## Deployment
 
@@ -159,8 +163,10 @@ The changes made for the $IMD launch, and the audit findings behind them, are li
 
 1. Create the ETH/$IMD game pool: fee 9000, tick spacing 180, hooks set to the hook, at the 1% pool's price.
 2. `setOperator(bot)`.
-3. `setBuybackPool(ETH/$IMD 1%)`.
-4. `setHostBuybackPool(ETH/$PFWA holder pool)`.
+
+The two burn pools (ETH/$IMD 1% and the ETH/$PFWA holder pool) are fixed in the hook at deployment; the script
+only checks that both exist. A later owner handover is `setOwner(next)` by the owner, then `acceptOwner()` by
+`next`; nothing changes until they accept, and `setOwner(0)` cancels.
 
 ### Where we would like the most scrutiny (v2)
 

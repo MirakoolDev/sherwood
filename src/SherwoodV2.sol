@@ -184,11 +184,22 @@ contract SherwoodV2 is IHooks, IUnlockCallback {
     /// but nothing is scored (no points, no `bought`, no first play for referrals).
     uint256 public immutable GENESIS;
 
+    // The two burn pools are fixed here, not set after deployment: the launch factory makes no setup
+    // calls, and nothing (owner included) may redirect the burn share to a pool whose hook could take
+    // the ETH. The currencies come from the constructor; the rest of each key is the existing pool's.
+    /// The game token's buyback pool: the existing ETH/token 1% pool, no hook.
+    uint24 internal constant BURN_POOL_FEE = 10_000;
+    int24 internal constant BURN_POOL_TICK_SPACING = 100;
+    /// The host token's buyback pool: the ETH/$PFWA holder pool (dynamic fee, Hookr's holder hook).
+    uint24 internal constant HOST_POOL_FEE = 0x800000; // LPFeeLibrary.DYNAMIC_FEE_FLAG
+    int24 internal constant HOST_POOL_TICK_SPACING = 200;
+    address internal constant HOST_POOL_HOOK = 0xb914f955294799de4b891bd2EA8AF628Fa1c68CC;
+
     address public owner;
+    /// @notice Who `owner` named to take over; becomes owner on acceptOwner (0 = no handover pending).
+    address public pendingOwner;
     address public operator; // runs buybacks and Dice refunds
     PoolId public poolId; // the one ETH/token pool this hook serves
-    PoolKey public buybackPool; // where the buyback share is swapped for the token (another ETH/token pool)
-    PoolKey public hostBuybackPool; // where the host buyback share is swapped for the host token (an ETH/host pool)
 
     // ── Game state ──────────────────────────────────────────────────────────────
     mapping(uint256 round => mapping(address player => int256)) public points; // can go negative
@@ -296,9 +307,9 @@ contract SherwoodV2 is IHooks, IUnlockCallback {
     event BuybackBurned(uint256 ethIn, uint256 tokenBurned);
     event HostBuybackBurned(uint256 ethIn, uint256 hostBurned);
     event OwnerChanged(address owner);
+    /// @notice `owner` named `pendingOwner` to take over (0 = a pending handover was cancelled).
+    event OwnerProposed(address pendingOwner);
     event OperatorChanged(address operator);
-    event BuybackPoolChanged(PoolId id);
-    event HostBuybackPoolChanged(PoolId id);
     /// @notice A SHIELD move spent a charge: `player` is shielded until `until`.
     event ShieldArmed(uint256 indexed round, address indexed player, uint256 until);
     /// @notice A Steal or Robin Hood hit a shield: `attacker` paid `points` to `defender` and the shield broke.
@@ -329,7 +340,6 @@ contract SherwoodV2 is IHooks, IUnlockCallback {
     error ClaimWindowClosed();
     error FlipNotExpired();
     error TooLittleOut();
-    error BadBuybackPool();
     error TransferFailed();
 
     modifier onlyPoolManager() {
@@ -1069,7 +1079,7 @@ contract SherwoodV2 is IHooks, IUnlockCallback {
     /// Both burns: `isHost` picks the pool, and the reserve a partial fill goes back to.
     function unlockCallback(bytes calldata data) external onlyPoolManager returns (bytes memory) {
         (bool isHost, uint256 amount, uint256 minOut) = abi.decode(data, (bool, uint256, uint256));
-        PoolKey memory key = isHost ? hostBuybackPool : buybackPool;
+        PoolKey memory key = isHost ? hostBuybackPool() : buybackPool();
         BalanceDelta delta = poolManager.swap(
             key,
             SwapParams({
@@ -1096,42 +1106,39 @@ contract SherwoodV2 is IHooks, IUnlockCallback {
         dice.refundRequest(diceProvider, sequence); // the refund arrives through receive()
     }
 
-    // ── Admin: who runs buybacks, and (once) which pools they use. Nothing else. ─
+    /// @notice Where the buyback share is swapped for the game token and burned: the existing ETH/token
+    /// 1% pool, no hook. In the host token's own game that is the holder pool (hostBuybackPool).
+    function buybackPool() public view returns (PoolKey memory) {
+        if (!hostEnabled) return hostBuybackPool();
+        return PoolKey(Currency.wrap(address(0)), token, BURN_POOL_FEE, BURN_POOL_TICK_SPACING, IHooks(address(0)));
+    }
 
+    /// @notice Where the host buyback share is swapped for the host token and burned: the ETH/host
+    /// holder pool, a dynamic-fee pool with Hookr's holder hook.
+    function hostBuybackPool() public view returns (PoolKey memory) {
+        return PoolKey(Currency.wrap(address(0)), host, HOST_POOL_FEE, HOST_POOL_TICK_SPACING, IHooks(HOST_POOL_HOOK));
+    }
+
+    // ── Admin: who owns the hook and who runs buybacks. Nothing else. ───────────
+
+    /// Names the next owner, who takes over with acceptOwner. Nothing changes until they do, so a
+    /// wrong address is harmless; naming address(0) cancels a pending handover.
     function setOwner(address next) external onlyOwner {
-        owner = next;
-        emit OwnerChanged(next);
+        pendingOwner = next;
+        emit OwnerProposed(next);
+    }
+
+    /// The named next owner takes over.
+    function acceptOwner() external {
+        if (msg.sender != pendingOwner) revert NotOwner();
+        owner = msg.sender;
+        delete pendingOwner;
+        emit OwnerChanged(msg.sender);
     }
 
     function setOperator(address next) external onlyOwner {
         operator = next;
         emit OperatorChanged(next);
-    }
-
-    /// Set once, at launch: after that nobody can redirect the buyback reserve.
-    function setBuybackPool(PoolKey calldata key) external onlyOwner {
-        if (Currency.unwrap(buybackPool.currency1) != address(0)) revert PoolAlreadySet();
-        _checkBuybackPool(key, token);
-        buybackPool = key;
-        emit BuybackPoolChanged(key.toId());
-    }
-
-    /// Set once, at launch: after that nobody can redirect the host buyback reserve.
-    function setHostBuybackPool(PoolKey calldata key) external onlyOwner {
-        if (Currency.unwrap(hostBuybackPool.currency1) != address(0)) revert PoolAlreadySet();
-        _checkBuybackPool(key, host);
-        hostBuybackPool = key;
-        emit HostBuybackPoolChanged(key.toId());
-    }
-
-    /// A buyback pool trades native ETH for `out`, and isn't the game pool or any pool of this hook.
-    function _checkBuybackPool(PoolKey calldata key, Currency out) internal view {
-        if (!key.currency0.isAddressZero() || Currency.unwrap(key.currency1) != Currency.unwrap(out)) {
-            revert BadBuybackPool();
-        }
-        if (PoolId.unwrap(key.toId()) == PoolId.unwrap(poolId) || address(key.hooks) == address(this)) {
-            revert BadBuybackPool();
-        }
     }
 
     // ── Views for the site ──────────────────────────────────────────────────────

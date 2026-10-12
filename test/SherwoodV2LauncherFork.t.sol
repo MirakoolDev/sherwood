@@ -9,6 +9,7 @@ import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {PoolId} from "v4-core/src/types/PoolId.sol";
 import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
@@ -69,9 +70,12 @@ contract SherwoodV2LauncherForkTest is Test {
         vm.startPrank(ADMIN);
         MANAGER.initialize(key, price);
         game.setOperator(BOT);
-        game.setBuybackPool(burnKey);
-        game.setHostBuybackPool(hostKey);
         vm.stopPrank();
+        // Both burn pools are fixed in the hook at deployment: the live 1% pool and the live holder pool.
+        assertEq(PoolId.unwrap(game.buybackPool().toId()), PoolId.unwrap(burnKey.toId()));
+        assertEq(PoolId.unwrap(game.hostBuybackPool().toId()), PoolId.unwrap(hostKey.toId()));
+        (uint160 hostPrice,,,) = MANAGER.getSlot0(hostKey.toId());
+        assertGt(hostPrice, 0, "the holder pool exists on the live chain");
 
         // Community liquidity: one-sided $IMD below the price, where buys push the tick.
         PoolModifyLiquidityTest lp = new PoolModifyLiquidityTest(MANAGER);

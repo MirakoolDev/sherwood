@@ -7,7 +7,9 @@ hostHolderMin, dice, diceProvider, owner (`$owner`), genesis. The launcher alrea
 as it arrived (nonpayable constructor, static argument types, 8 of at most 16 arguments, an explicit
 owner argument, no call to any other contract in either constructor, no proxy, no DELEGATECALL,
 CALLCODE or SELFDESTRUCT, no minting, pausing or seizing). No change was needed to it, to the game
-rules or to the pot split. The changes below are the fixes for the imported audit.
+rules or to the pot split. The changes below are the fixes for the imported audits: revisions 1 to 3 for
+launch 1355's audit, and revision 4 (at the end of this file) for the audit of this launch, which fixed
+both burn pools in the hook at deployment and made the owner handover two-step.
 
 ## Changes
 
@@ -73,8 +75,9 @@ The focus areas in the brief were read against the code and the tests; nothing e
   of the deployment service must allow it. About 1 launch in 400 needs more than 100k tries (about 9M
   gas for the search alone), as the audit noted.
 - After deployment the owner (`0x420944b441715e34dd672ae0eb4526a7ad7d1eef`) runs the setup in
-  `script/SetupSherwoodV2.s.sol`: create the ETH/$IMD game pool, `setOperator`, `setBuybackPool`
-  (the ETH/$IMD 1% pool) and `setHostBuybackPool` (the $PFWA holder pool).
+  `script/SetupSherwoodV2.s.sol`: create the ETH/$IMD game pool and `setOperator`. Since revision 4 the
+  two burn pools (the ETH/$IMD 1% pool and the $PFWA holder pool) are fixed in the hook at deployment
+  and need no setup call.
 
 ## Revision 1: King of the Hill on boards above MAX_LEADER_SCAN (finding 5643a8ad, high)
 
@@ -185,3 +188,60 @@ hour, then loses a flip on a 13-player board; nobody plays again. Before the cha
 with her hour and carol, #1 for the other 19 hours, gets nothing (the test fails); after it carol is King
 with exactly the spell, equal to `reignOf`, and alice keeps her hour. Full suite: 253 pass (2 skipped),
 including the fork suites against the Robinhood Chain RPC.
+
+## Revision 4 (this launch's audit of the imported code): burn pools fixed at deployment, two-step owner
+
+The launch rules want every contract fully configured in its constructor, with the factory making no
+setup calls, and the brief fixes the launcher's eight constructor arguments (so does the `launch.json`
+in the tree). Both findings below are fixed inside the hook without a new argument: the burn pool keys
+are fixed values of the existing pools, derived from the `token` and `host` arguments, as the launch
+reference asks ("make values that never change constants, and derive what follows from other
+arguments"). The launcher, the game rules and the split are unchanged.
+
+### Changes
+
+| # | File | Change | Why |
+|---|---|---|---|
+| 1 | `src/SherwoodV2.sol` (storage `buybackPool` / `hostBuybackPool`, `setBuybackPool`, `setHostBuybackPool`, `_checkBuybackPool`, `BadBuybackPool`, the two `*PoolChanged` events removed; new constants `BURN_POOL_FEE` 10000, `BURN_POOL_TICK_SPACING` 100, `HOST_POOL_FEE` 0x800000, `HOST_POOL_TICK_SPACING` 200, `HOST_POOL_HOOK` 0xb914f955294799de4b891bd2EA8AF628Fa1c68CC; new views `buybackPool()` and `hostBuybackPool()`; `unlockCallback` reads them) | The game token's burn pool is the existing ETH/token 1% pool with no hook; the host burn pool is the ETH/$PFWA holder pool (dynamic fee, Hookr's holder hook). Both keys are built from the constructor's `token` and `host` and these constants: nobody, the owner included, can point a reserve at another pool. In the host token's own game (`host == token`) the one burn goes through the holder pool, which is what the $PFWA fork test did by hand before. The constructor still calls no contract (the empty-chain rehearsal passes), and the pools are only touched on first burn: a wrong or missing pool reverts that burn and the reserve stays. | Medium `6e8f43a0…` reproduced on the code as it arrived: the owner could set a pool whose hook takes the ETH (the audit's CaptureHook) and the burn reserve left through it. The brief names the two pools; the launch rules forbid post-deployment configuration. |
+| 2 | `src/SherwoodV2.sol` (`setOwner` now records `pendingOwner` and emits `OwnerProposed`; new `acceptOwner`, new `pendingOwner` view) | A handover is two-step: `setOwner(next)` names the next owner and changes nothing; `next` takes over with `acceptOwner()`. `setOwner(0)` (or any address nobody controls) is harmless and cancels a pending handover. | Low `cf003baf…` reproduced: `setOwner(address(0))` on a fresh hook left it with no owner, so no game pool could ever be created and both reserves were dead. |
+| 3 | `script/SetupSherwoodV2.s.sol` | Steps 3 and 4 (the two setters) removed; the script now checks that both fixed pools exist on the chain before creating the game pool and naming the operator. | Follows change 1. |
+| 4 | `test/helpers/MockHolderHook.sol` (new), `test/helpers/SherwoodV2Fixture.sol`, `test/SherwoodV2.t.sol` setUp | The unit tests take both burn keys from the hook and etch a permissive stand-in for the holder hook at its fixed address (its address flags, 0x28CC, require `beforeInitialize`, `beforeAddLiquidity`, `beforeSwap` and `afterSwap` to answer). `_configureBurns` is gone (nothing to configure); `_reshapeBurnLiquidity` replaces a fixed pool's liquidity with a narrow or empty position for the partial-fill and empty-pool tests that used to create their own pools. | Tests must run on the fixed keys. |
+| 5 | `test/SherwoodV2LaunchConfig.t.sol` (new) | `test_burnPoolsAreTheBriefsPoolsDerivedFromTheConstructor`; `test_ownerCannotRedirectTheBurnToACapturePool` (the audit's reproduction: the capture pool exists, no setter accepts it, the burn goes through the 1% pool and the thief gets nothing); `test_ownerHandoverIsTwoStep`; `test_ownerHandoverToAWrongAddressIsHarmlessAndCancellable` (the audit's reproduction on a fresh hook: after `setOwner(0)` and a cancelled typo, the owner still creates the game pool and names the operator). | Every change is tested. |
+| 6 | `test/SherwoodV2.t.sol` | `test_buybackPoolCannotBeTheGamePool`, `test_buybackPoolIsSetOnce` and `test_hostBuybackPoolIsSetOnceAndValidated` (they encoded the setters) became `test_buybackPoolIsFixedToTheOnePercentPoolWithNoSetter` and `test_hostBuybackPoolIsFixedToTheHolderPoolWithNoSetter`; the two burn tests no longer call a setter; the own-game test checks that its one burn pool is the holder pool. | Behaviour the audit changed. |
+| 7 | `test/SherwoodV2BuybackHook.t.sol` | The hook-fee fuzz now etches the adversarial fee hook over the holder hook's fixed address and runs the host burn only: the game-token burn pool has no hook, so there is no outside hook there to account for. Same assertions (net deltas, atomic slippage revert, exact boundary). | Follows change 1. |
+| 8 | `test/SherwoodV2Accounting.t.sol`, `test/SherwoodV2Invariant.t.sol`, `test/SherwoodV2Fork.t.sol`, `test/SherwoodV2LauncherFork.t.sol` | Setter calls removed; the fork tests assert that the fixed keys are the live 1% pool and the live holder pool and that both exist; the owner-powers test checks `acceptOwner` is refused to anyone not named. | Follows changes 1 and 2. |
+| 9 | `README.md` | Roles table, external dependencies and the owner setup describe the fixed burn pools and the two-step handover. | Keeps the requester's notes in step. |
+
+### Audit findings
+
+| Finding | Status |
+|---|---|
+| Medium `6e8f43a0…` burn pools chosen by the owner after deployment | Reproduced on the code as it arrived by reading it: `_checkBuybackPool` accepted any fee, tick spacing and hook other than this one, and `unlockCallback` settled whatever `delta.amount0` the pool took, so a capture hook's pool was a valid burn pool and nothing tied the keys to the brief's pools. Fixed (change 1); tested by `test_ownerCannotRedirectTheBurnToACapturePool` (the audit's scenario on the fixed code) and the fixed-key tests. The fork rehearsal `test_forkLauncher_imdLaunchEndToEnd` burns through both live pools without any setup call. |
+| Low `cf003baf…` single-step `setOwner` with no zero check | Reproduced by reading: `setOwner` wrote any address in one step, and `beforeInitialize` and both setters required the owner. Fixed (change 2); tested by `test_ownerHandoverIsTwoStep` and `test_ownerHandoverToAWrongAddressIsHarmlessAndCancellable`. |
+| Info `5c06bb12…` open-ended salt mining | Not a defect in the code: the launcher is unchanged. The deployer sizes the gas ceiling for the tail, as the finding says: about 18M covers all but one draw in 500; the scratch factory rehearsal (salt 7 from a test probe) cost 6.9M. Kept under "Open items for the deployer". |
+
+### Bytecode
+
+Removing the two stored keys, the setters and their check freed more than the two-step owner and the two
+key views cost: `SherwoodV2` runtime 23,654 B (922 B under EIP-170, from 24,480). Launcher runtime 183 B,
+init code 25,436 B plus 256 B of arguments.
+
+### Checks run
+
+- `forge build --sizes`.
+- `forge test --no-match-contract Fork`: 253 tests pass in 11 suites (the invariant suite included).
+- `SHERWOOD_FORK_RPC_URL=https://rpc.mainnet.chain.robinhood.com forge test --match-contract Fork`: 10
+  pass, including the launcher rehearsal (deploy, pool creation, operator, a play, settlement, both burns
+  through the live ETH/$IMD 1% pool and the live holder pool).
+- A scratch copy of the protected harness (`test/scratch`, not submitted): the launcher's init code deployed
+  from a factory on an empty chain with chain id 4663, the hook's address carries 0x20CC, and neither runtime
+  has DELEGATECALL, CALLCODE or SELFDESTRUCT or exceeds 24,576 bytes.
+
+### Reviewed again and left as they are
+
+The focus areas were read once more against the changed code. The buyback `unlockCallback` is unchanged
+apart from where the key comes from: it settles exactly the ETH the pool took, burns exactly the net
+tokens, returns a partial fill to its own reserve and reverts whole on slippage (the fee-hook fuzz and the
+accounting tests still pass on the fixed keys). Settlement, claims, sweeps, referral cuts, the flip
+lifecycle, the charge clocks and the reign tracking were not touched. `setOperator` stays single-step: a
+wrong operator can only run burns with their own `minOut`, and the owner names another.

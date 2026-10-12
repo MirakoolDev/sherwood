@@ -135,8 +135,11 @@ abstract contract SherwoodV2Fixture is Test {
         );
         game = SherwoodV2(payable(hookAddress));
         gameKey = PoolKey(Currency.wrap(address(0)), Currency.wrap(address(gameToken)), 9000, 180, IHooks(hookAddress));
-        burnKey = PoolKey(Currency.wrap(address(0)), Currency.wrap(address(gameToken)), 10_000, 100, IHooks(address(0)));
-        hostKey = PoolKey(Currency.wrap(address(0)), Currency.wrap(address(hostToken)), 3000, 60, IHooks(address(0)));
+        // The burn pools are fixed in the hook: the ETH/token 1% pool and the ETH/host holder pool, whose
+        // hook lives at a fixed address. A permissive stand-in is etched there so the pool can exist here.
+        burnKey = game.buybackPool();
+        hostKey = game.hostBuybackPool();
+        deployCodeTo("MockHolderHook.sol:MockHolderHook", "", address(hostKey.hooks));
         vm.prank(owner);
         manager.initialize(gameKey, PRICE_ONE);
         manager.initialize(burnKey, PRICE_ONE);
@@ -157,11 +160,11 @@ abstract contract SherwoodV2Fixture is Test {
         );
     }
 
-    function _configureBurns() internal {
-        vm.startPrank(owner);
-        game.setBuybackPool(burnKey);
-        game.setHostBuybackPool(hostKey);
-        vm.stopPrank();
+    /// Replaces the wide liquidity setUp put in a burn pool with `liquidity` over the one tick range
+    /// around the price (0 = leave the pool empty), to exercise partial and empty fills.
+    function _reshapeBurnLiquidity(PoolKey memory key_, int256 liquidity) internal {
+        liquidityRouter.modifyLiquidity(key_, ModifyLiquidityParams(-60000, 60000, -1_000e18, bytes32(0)), "");
+        if (liquidity > 0) _liquidity(key_, -key_.tickSpacing, key_.tickSpacing, liquidity);
     }
 
     function _buy(address who, uint256 amount, SherwoodV2.Move move) internal returns (BalanceDelta) {

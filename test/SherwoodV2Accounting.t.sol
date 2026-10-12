@@ -107,13 +107,8 @@ contract SherwoodV2AccountingTest is SherwoodV2Fixture {
 
     function _partialBurn(bool host) internal {
         MockERC20 outToken = host ? hostToken : gameToken;
-        PoolKey memory narrow =
-            PoolKey(Currency.wrap(address(0)), Currency.wrap(address(outToken)), 500, 10, IHooks(address(0)));
-        manager.initialize(narrow, PRICE_ONE);
-        _liquidity(narrow, -10, 10, 1e15);
-        vm.prank(owner);
-        if (host) game.setHostBuybackPool(narrow);
-        else game.setBuybackPool(narrow);
+        // The burn pools are fixed, so the fixed pool's liquidity is made narrow enough to run out.
+        _reshapeBurnLiquidity(host ? hostKey : burnKey, 1e15);
         uint256 round = game.currentRound();
         _seed(round, 10 ether);
         _finishRound(round);
@@ -139,7 +134,6 @@ contract SherwoodV2AccountingTest is SherwoodV2Fixture {
 
     /// forge-config: default.fuzz.runs = 1000
     function testFuzz_slippageRevertIsAtomicForEitherBurn(bool host, uint256 seed) public {
-        _configureBurns();
         _seed(0, bound(seed, 1 ether, 100 ether));
         _finishRound(0);
         uint256 gameReserve = game.buybackReserve();
@@ -164,11 +158,7 @@ contract SherwoodV2AccountingTest is SherwoodV2Fixture {
     }
 
     function test_emptyBuybackLiquidityPreservesReserveAndClaims() public {
-        PoolKey memory empty = burnKey;
-        empty.fee = 500;
-        manager.initialize(empty, PRICE_ONE);
-        vm.prank(owner);
-        game.setBuybackPool(empty);
+        _reshapeBurnLiquidity(burnKey, 0); // the fixed burn pool, with its liquidity gone
         _buy(alice, 0.01 ether, SherwoodV2.Move.BUY);
         _finishRound(0);
         uint256 reserve = game.buybackReserve();
@@ -288,12 +278,11 @@ contract SherwoodV2AccountingTest is SherwoodV2Fixture {
         game.setOperator(alice);
         vm.startPrank(alice);
         vm.expectRevert(SherwoodV2.NotOwner.selector);
-        game.setBuybackPool(burnKey);
-        vm.expectRevert(SherwoodV2.NotOwner.selector);
-        game.setHostBuybackPool(hostKey);
-        vm.expectRevert(SherwoodV2.NotOwner.selector);
         game.setOwner(alice);
+        vm.expectRevert(SherwoodV2.NotOwner.selector);
+        game.acceptOwner(); // the operator was never named next owner either
         vm.stopPrank();
         assertEq(game.owner(), owner);
+        assertEq(game.pendingOwner(), address(0));
     }
 }

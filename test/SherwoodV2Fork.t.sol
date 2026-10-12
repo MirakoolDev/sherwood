@@ -145,8 +145,9 @@ contract SherwoodV2ForkTest is Test {
         assertFalse(hook.hostEnabled());
         assertEq(hook.hostBuybackReserve(), 0);
         assertEq(reserve, (0.005 ether * 1000) / 10_000 + (0.005 ether * 700) / 10_000);
+        // $PFWA's own game burns through the holder pool, fixed in the hook.
+        assertEq(PoolId.unwrap(hook.buybackPool().toId()), PoolId.unwrap(holderKey.toId()));
         vm.startPrank(ADMIN);
-        hook.setBuybackPool(holderKey);
         uint256 deadBefore = IERC20(PFWA).balanceOf(DEAD);
         hook.buybackAndBurn(reserve, 1);
         vm.stopPrank();
@@ -243,8 +244,9 @@ contract SherwoodV2ForkTest is Test {
         uint256 reserve = game.hostBuybackReserve();
         assertEq(reserve, (total * 700) / 10_000);
 
+        // The host burn pool is fixed in the hook: Hookr's dynamic-fee ETH/$PFWA holder pool.
+        assertEq(PoolId.unwrap(game.hostBuybackPool().toId()), PoolId.unwrap(holderKey.toId()));
         vm.startPrank(ADMIN);
-        game.setHostBuybackPool(holderKey); // Hookr's dynamic-fee ETH/$PFWA pool
         uint256 deadBefore = IERC20(PFWA).balanceOf(DEAD);
         game.buybackAndBurnHost(reserve, 1);
         vm.stopPrank();

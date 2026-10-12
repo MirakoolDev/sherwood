@@ -3,11 +3,9 @@ pragma solidity 0.8.26;
 
 import {SherwoodV2Fixture} from "./helpers/SherwoodV2Fixture.sol";
 import {SherwoodV2} from "src/SherwoodV2.sol";
-import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
-import {Currency} from "v4-core/src/types/Currency.sol";
 import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta, toBeforeSwapDelta} from "v4-core/src/types/BeforeSwapDelta.sol";
@@ -48,53 +46,45 @@ contract AuditBurnFeeHook {
     }
 }
 
+/// The host burn runs through the holder pool, whose hook is another contract's. Its address is fixed
+/// in the game, so the adversarial hook is etched over the fixture's stand-in at that address once the
+/// pool exists. The game-token burn pool has no hook, so there is nothing of the kind to test there.
 contract SherwoodV2BuybackHookTest is SherwoodV2Fixture {
     /// forge-config: default.fuzz.runs = 1000
-    function testFuzz_burnUsesNetDeltasIncludingExternalHookFees(bool isHost, uint256 amountSeed) public {
-        MockERC20 output = isHost ? hostToken : gameToken;
-        address feeAddress = address(uint160(0xBACC0000) | uint160(0xCC));
+    function testFuzz_hostBurnUsesNetDeltasIncludingTheHolderHooksFees(uint256 amountSeed) public {
+        address feeAddress = address(hostKey.hooks);
         deployCodeTo("SherwoodV2BuybackHook.t.sol:AuditBurnFeeHook", abi.encode(manager), feeAddress);
         AuditBurnFeeHook feeHook = AuditBurnFeeHook(payable(feeAddress));
-        PoolKey memory feeKey =
-            PoolKey(Currency.wrap(address(0)), Currency.wrap(address(output)), 0x800000, 60, IHooks(feeAddress));
-        manager.initialize(feeKey, PRICE_ONE);
-        _liquidity(feeKey, -60000, 60000, 1_000e18);
-        vm.prank(owner);
-        if (isHost) game.setHostBuybackPool(feeKey);
-        else game.setBuybackPool(feeKey);
         _seed(0, bound(amountSeed, 1 ether, 10 ether));
         _finishRound(0);
-        uint256 reserve = isHost ? game.hostBuybackReserve() : game.buybackReserve();
-        uint256 other = isHost ? game.buybackReserve() : game.hostBuybackReserve();
+        uint256 reserve = game.hostBuybackReserve();
+        uint256 other = game.buybackReserve();
         uint256 beforeETH = address(game).balance;
         uint256 managerBefore = address(manager).balance;
         uint256 snapshot = vm.snapshotState();
         vm.prank(owner);
-        if (isHost) game.buybackAndBurnHost(reserve, 0);
-        else game.buybackAndBurn(reserve, 0);
-        uint256 netOut = output.balanceOf(DEAD);
+        game.buybackAndBurnHost(reserve, 0);
+        uint256 netOut = hostToken.balanceOf(DEAD);
         assertGt(netOut, 0);
         assertGt(feeHook.tokenFees(), 0);
         assertEq(feeAddress.balance, reserve / 100);
         assertEq(feeHook.ethFees(), feeAddress.balance);
-        assertEq(output.balanceOf(feeAddress), feeHook.tokenFees());
+        assertEq(hostToken.balanceOf(feeAddress), feeHook.tokenFees());
         assertEq(beforeETH - address(game).balance, reserve);
         assertEq(address(manager).balance - managerBefore + feeAddress.balance, reserve);
-        assertEq(isHost ? game.hostBuybackReserve() : game.buybackReserve(), 0);
-        assertEq(isHost ? game.buybackReserve() : game.hostBuybackReserve(), other);
-        assertEq(isHost ? gameToken.balanceOf(DEAD) : hostToken.balanceOf(DEAD), 0);
+        assertEq(game.hostBuybackReserve(), 0);
+        assertEq(game.buybackReserve(), other);
+        assertEq(gameToken.balanceOf(DEAD), 0);
         assertTrue(vm.revertToState(snapshot));
         vm.prank(owner);
         vm.expectRevert(SherwoodV2.TooLittleOut.selector);
-        if (isHost) game.buybackAndBurnHost(reserve, netOut + 1);
-        else game.buybackAndBurn(reserve, netOut + 1);
+        game.buybackAndBurnHost(reserve, netOut + 1);
         assertEq(feeAddress.balance, 0, "failed slippage must revert the outside hook's fee too");
-        assertEq(output.balanceOf(feeAddress), 0);
+        assertEq(hostToken.balanceOf(feeAddress), 0);
         assertEq(feeHook.ethFees(), 0);
         assertEq(feeHook.tokenFees(), 0);
         vm.prank(owner);
-        if (isHost) game.buybackAndBurnHost(reserve, netOut);
-        else game.buybackAndBurn(reserve, netOut);
-        assertEq(output.balanceOf(DEAD), netOut, "slippage boundary is the actual net tokens burned");
+        game.buybackAndBurnHost(reserve, netOut);
+        assertEq(hostToken.balanceOf(DEAD), netOut, "slippage boundary is the actual net tokens burned");
     }
 }

@@ -182,9 +182,14 @@ contract SherwoodV2Test is Test, Deployers {
         vm.prank(owner);
         (gameKey,) = initPool(eth, pfwa, IHooks(hookAddr), 3000, SQRT_PRICE_1_1);
         _addLiquidity(gameKey);
-        (buybackKey,) = initPool(eth, pfwa, IHooks(address(0)), 3000, SQRT_PRICE_1_1);
+        // The burn pools are fixed in the hook: the ETH/token 1% pool and the ETH/host holder pool, whose
+        // hook lives at a fixed address. A permissive stand-in is etched there so the pool can exist here.
+        buybackKey = hook.buybackPool();
+        hostKey = hook.hostBuybackPool();
+        deployCodeTo("MockHolderHook.sol:MockHolderHook", "", address(hostKey.hooks));
+        manager.initialize(buybackKey, SQRT_PRICE_1_1);
         _addLiquidity(buybackKey);
-        (hostKey,) = initPool(eth, Currency.wrap(address(hostToken)), IHooks(address(0)), 3000, SQRT_PRICE_1_1);
+        manager.initialize(hostKey, SQRT_PRICE_1_1);
         _addLiquidity(hostKey);
     }
 
@@ -1575,8 +1580,6 @@ contract SherwoodV2Test is Test, Deployers {
         vm.expectRevert(SherwoodV2.NotOperator.selector);
         hook.buybackAndBurn(reserve, 0);
 
-        vm.prank(owner);
-        hook.setBuybackPool(buybackKey);
         uint256 deadBefore = gameToken.balanceOf(DEAD);
         vm.prank(owner);
         hook.buybackAndBurn(reserve, 1);
@@ -1584,18 +1587,20 @@ contract SherwoodV2Test is Test, Deployers {
         assertEq(hook.buybackReserve(), 0);
     }
 
-    function test_buybackPoolCannotBeTheGamePool() public {
+    /// The burn pool is fixed at deployment to the existing ETH/token 1% pool: nobody, the owner
+    /// included, can point the buyback reserve anywhere else (a pool with a hook could take the ETH).
+    function test_buybackPoolIsFixedToTheOnePercentPoolWithNoSetter() public {
+        PoolKey memory k = hook.buybackPool();
+        assertEq(Currency.unwrap(k.currency0), address(0));
+        assertEq(Currency.unwrap(k.currency1), address(gameToken));
+        assertEq(k.fee, 10_000);
+        assertEq(k.tickSpacing, 100);
+        assertEq(address(k.hooks), address(0));
+        assertTrue(PoolId.unwrap(k.toId()) != PoolId.unwrap(hook.poolId()));
         vm.prank(owner);
-        vm.expectRevert(SherwoodV2.BadBuybackPool.selector);
-        hook.setBuybackPool(gameKey);
-    }
-
-    function test_buybackPoolIsSetOnce() public {
-        vm.prank(owner);
-        hook.setBuybackPool(buybackKey);
-        vm.prank(owner);
-        vm.expectRevert(SherwoodV2.PoolAlreadySet.selector);
-        hook.setBuybackPool(buybackKey);
+        (bool ok,) = address(hook)
+            .call(abi.encodeWithSignature("setBuybackPool((address,address,uint24,int24,address))", gameKey));
+        assertFalse(ok, "the setter is gone");
     }
 
     function test_recentPlayersMostRecentFirst() public {
@@ -2171,35 +2176,19 @@ contract SherwoodV2Test is Test, Deployers {
         assertEq(hook.hostBuybackReserve(), _bps(total, 700) + _bps(total2, 700));
     }
 
-    function test_hostBuybackPoolIsSetOnceAndValidated() public {
-        vm.prank(alice);
-        vm.expectRevert(SherwoodV2.NotOwner.selector);
-        hook.setHostBuybackPool(hostKey);
-
-        vm.startPrank(owner);
-        vm.expectRevert(SherwoodV2.BadBuybackPool.selector);
-        hook.setHostBuybackPool(gameKey); // the game pool (and the wrong token)
-        vm.expectRevert(SherwoodV2.BadBuybackPool.selector);
-        hook.setHostBuybackPool(buybackKey); // an ETH/game-token pool
-        PoolKey memory k = hostKey;
-        k.hooks = IHooks(address(hook));
-        vm.expectRevert(SherwoodV2.BadBuybackPool.selector);
-        hook.setHostBuybackPool(k); // a pool of this hook
-        k = hostKey;
-        k.currency0 = Currency.wrap(address(gameToken));
-        vm.expectRevert(SherwoodV2.BadBuybackPool.selector);
-        hook.setHostBuybackPool(k); // not native ETH
-        vm.expectRevert(SherwoodV2.BadBuybackPool.selector);
-        hook.setBuybackPool(hostKey); // and the game burn can't buy the host token
-
-        hook.setHostBuybackPool(hostKey);
-        (Currency c0, Currency c1,,, IHooks h) = hook.hostBuybackPool();
-        assertEq(Currency.unwrap(c0), address(0));
-        assertEq(Currency.unwrap(c1), address(hostToken));
-        assertEq(address(h), address(0));
-        vm.expectRevert(SherwoodV2.PoolAlreadySet.selector);
-        hook.setHostBuybackPool(hostKey);
-        vm.stopPrank();
+    /// The host burn pool is fixed at deployment to the ETH/$PFWA holder pool (dynamic fee, tick
+    /// spacing 200, Hookr's holder hook), with the host token from the constructor: no setter.
+    function test_hostBuybackPoolIsFixedToTheHolderPoolWithNoSetter() public {
+        PoolKey memory k = hook.hostBuybackPool();
+        assertEq(Currency.unwrap(k.currency0), address(0));
+        assertEq(Currency.unwrap(k.currency1), address(hostToken));
+        assertEq(k.fee, 0x800000);
+        assertEq(k.tickSpacing, 200);
+        assertEq(address(k.hooks), 0xb914f955294799de4b891bd2EA8AF628Fa1c68CC);
+        vm.prank(owner);
+        (bool ok,) =
+            address(hook).call(abi.encodeWithSignature("setHostBuybackPool((address,address,uint24,int24,address))", k));
+        assertFalse(ok, "the setter is gone");
     }
 
     function test_buybackAndBurnHostBurnsHostToDead() public {
@@ -2214,8 +2203,6 @@ contract SherwoodV2Test is Test, Deployers {
         vm.expectRevert(SherwoodV2.NotOperator.selector);
         hook.buybackAndBurnHost(reserve, 0);
 
-        vm.prank(owner);
-        hook.setHostBuybackPool(hostKey);
         vm.prank(owner);
         vm.expectRevert(SherwoodV2.TooLittleOut.selector);
         hook.buybackAndBurnHost(reserve, type(uint256).max);
@@ -2250,8 +2237,6 @@ contract SherwoodV2Test is Test, Deployers {
         assertTrue(found);
 
         // The game burn still runs on its own pool and reserve.
-        vm.prank(owner);
-        hook.setBuybackPool(buybackKey);
         vm.prank(op);
         hook.buybackAndBurn(gameReserve, 1);
         assertGt(gameToken.balanceOf(DEAD), deadGame);
@@ -2301,6 +2286,12 @@ contract SherwoodV2Test is Test, Deployers {
         manager.initialize(key, SQRT_PRICE_1_1);
         _addLiquidity(key);
         assertFalse(own.hostEnabled());
+        // One burn, through the holder pool of the (host = game) token.
+        PoolKey memory burn = own.buybackPool();
+        assertEq(Currency.unwrap(burn.currency1), address(gameToken));
+        assertEq(burn.fee, hostKey.fee);
+        assertEq(burn.tickSpacing, hostKey.tickSpacing);
+        assertEq(address(burn.hooks), address(hostKey.hooks));
 
         uint256 round = own.currentRound();
         gameToken.mint(alice, HOST_MIN * 10); // holds plenty of the host (= game) token

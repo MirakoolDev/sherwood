@@ -91,6 +91,53 @@ the compiler re-reads the opcode at each use, so a cached value moves with every
 (fee equal to the buy's 5% flips, one wei more scores as a buy); the pot-short branch it used to
 reach is unreachable since that bound.
 
+## Revision 5 (this launch): edges and a second invariant trajectory
+
+`SherwoodV2Edges.t.sol` (21 tests, real PoolManager through the shared fixture) pins what the suite
+above did not: the zero and the empty, the same call twice, odd hook data and the last second of a round.
+
+- Settlement: a zero batch makes no progress and never reverts; an empty round settles (even with a
+  zero batch) into the two burns and an 83% rollover with nothing to claim or sweep; the rollover lands
+  in the round live at settlement, not the next one; settling the live round, one second early, or an
+  impossible round number reverts; claims, sweeps and referral claims for rounds that never settled
+  revert; a second claim reverts and a sweep after a full claim moves nothing.
+- Burns: the reserve clamps the amount (a request of ten times the reserve spends exactly the
+  reserve and leaves the other reserve alone) and an empty reserve cannot burn.
+- Hook data: 33, 63 and 20 bytes decode the move word and ignore the rest; 64 bytes with an unknown
+  move keep the referrer (and the welcome bonus) and play as a Buy.
+- Moves: Robin Hood by the leader plays as a Buy and keeps its charge; a Steal from a previous player
+  wiped to zero spends its charge and moves nothing; a shield raised ten minutes before the round's
+  end still reflects a Steal five minutes into the next round, with the holder bonus on the defender.
+- Flips at the boundary: a flip in the last second of a round expires exactly at
+  `requestedAt + 10 min`, before settlement opens, scores as a buy in its own round, starts no reign
+  (no King), and a second expiry, an unknown sequence or a late reveal change nothing.
+- `kingOfTheHill` as an oracle: the open-round view, the closing-time view and the settled King agree.
+- Fuzzed properties (200 to 300 runs each, inline config): every wei of a settled pot lands in exactly
+  one of prizes, the referral cut, the two reserves and the rollover, with fuzzed partial sales by all
+  three winners and a referred #1 who is also King, through claims, a referral claim and the sweep;
+  buy points, fee and `bought` follow the ETH in from one wei up; Steal charges never exceed 18, a landed
+  Steal spends exactly one and a Steal with none plays as a Buy, with `nextCharges` in step; Robin Hood
+  charges land on the hour from the spend up to three; a shield charge appears exactly when the round's
+  cumulative play crosses a 0.025 ETH mark and a SHIELD spends it; Steals, Robin Hoods and reflects
+  are zero-sum over any sequence of plays; `fundPot` takes exactly the current round through 365 ahead.
+
+`SherwoodV2FreshBoardInvariant.t.sol` runs the existing six-actor handler from a different start (no
+settled round, the Dice fee at its cap, a reflected Robin Hood that left a player below zero and a
+flip pending) for 128 sequences of depth 64 with reverts failing the run, and checks after every call
+that ETH held equals every obligation and never exceeds what came in, that the reign holder of the live
+round is the cached #1 with the most points (and #1 is never unknown on a six-player board), and that
+settled rounds keep seven days to claim, hold no pending flips and award no prize above its share or to
+a player at or below zero.
+
+Harness notes: under via-IR a `block.timestamp` cached before `vm.warp` moves with the warp, so the
+new tests read `vm.getBlockTimestamp()` or derive times from `GENESIS`; and a `vm.expectRevert` must
+not be followed by a view call used as an argument (the view is the "next call").
+
+No defect was found in this revision: every property above holds on the code as it is, and the three
+failures seen while writing them were harness mistakes (a cached timestamp, an argument view call under
+`expectRevert`, and a sanity check that forgot the rollover). No fork run was made in this revision;
+the live rehearsal in `SherwoodV2LauncherFork.t.sol` is still owed before deployment.
+
 ## Reported, not asserted
 
 When a round ends while #1 is unknown, `settle` drops the whole final spell: it does not credit the
