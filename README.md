@@ -168,6 +168,12 @@ The two burn pools (ETH/$IMD 1% and the ETH/$PFWA holder pool) are fixed in the 
 only checks that both exist. A later owner handover is `setOwner(next)` by the owner, then `acceptOwner()` by
 `next`; nothing changes until they accept, and `setOwner(0)` cancels.
 
+### Keeping the game pool on the market price
+
+Until a game pool has liquidity, nobody can trade it, so its price stays where it was created while the market moves. [`src/PoolPriceAlign.sol`](src/PoolPriceAlign.sol) walks an empty pool's price to a reference pool's live price with a 1-wei swap limited to the target price. Across a stretch with no liquidity the swap moves the price and exchanges nothing; if any liquidity is in the way, tokens would change hands and the call reverts with `WouldTrade`. It holds no funds and has no owner.
+
+Deployed on Robinhood Chain at [`0xbdA0Bc2461c2f0706573878F2932F87526b43D63`](https://robinhoodchain.blockscout.com/address/0xbdA0Bc2461c2f0706573878F2932F87526b43D63). The site's upkeep job calls `align(gamePool, refPool)` when the $IMD game pool drifts 50 or more ticks from the 1% ETH/$IMD pool. [`script/AlignImdGamePool.s.sol`](script/AlignImdGamePool.s.sol) does the same by hand, and [`test/PoolPriceAlignFork.t.sol`](test/PoolPriceAlignFork.t.sol) checks it on a Robinhood Chain fork, including the revert when liquidity is in range.
+
 ### Where we would like the most scrutiny (v2)
 
 - **The two buyback swaps:** they share one `unlockCallback`, with a flag saying which burn it is. Slippage protection relies only on the operator's `minOut`.
