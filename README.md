@@ -181,3 +181,14 @@ Deployed on Robinhood Chain at [`0xbdA0Bc2461c2f0706573878F2932F87526b43D63`](ht
 - **Charge clocks:** `_charges`, `_spend` and `_nextCharge`.
 - **King of the Hill reign tracking:** `_updateReign` and the bounded leader rescan.
 - **Host bonus:** it reads the balance at play time, so a player could borrow 100k $PFWA for one transaction. The edge is 10% of points, and the swap fees for borrowing it by buying and selling cost more.
+
+## Sherwood v2.1
+
+[`src/SherwoodV21.sol`](src/SherwoodV21.sol) is Sherwood v2 with two changes, made for the $WIF game (PFWA's entry to the World is Flat hackathon). Everything else, from the moves and the split to settlement and claims, is the v2 code.
+
+1. **Shields hold blocks.** Every 0.01 ETH a player plays in a round (any move) banks one shield block, up to 5. A SHIELD move loads every banked block into a 30-minute shield (topping up one that is still up, to at most 5, and restarting its 30 minutes). Each Steal or Robin Hood the shield turns around uses one block, and the shield drops with its last block. A move that would take nothing reflects nothing and uses no block. New views: `shieldBlocks(player)`; `shieldStats(round, player)` now returns `uint8 charges` (blocks banked) instead of `bool charge`.
+2. **The token burns through the game pool itself.** `buybackPool()` returns the game pool (fee and tick spacing recorded when it is created), so the buyback buys the token where the game trades. The hook's own swap skips its callbacks (v4's `noSelfCall`), so the burn pays no pot fee and scores nothing. There is no separate burn pool to create or fund.
+
+Deployed on Robinhood Chain at [`0x45aC5C394f4fD8194fC4868c63A75d606a8A20CC`](https://robinhoodchain.blockscout.com/address/0x45aC5C394f4fD8194fC4868c63A75d606a8A20CC) for $WIF (`0x5173b8eA6923c2d40267890D45C46a3480954773`), with $PFWA as the host token. Rounds started at GENESIS `1793008800` (2026-10-26 10:00 UTC). Play at [sherwood.pfwa.fun/wif](https://sherwood.pfwa.fun/wif); the guide is at [sherwood.pfwa.fun/wif/docs](https://sherwood.pfwa.fun/wif/docs).
+
+[`script/PlanSherwoodV21.s.sol`](script/PlanSherwoodV21.s.sol) plans the three transactions the owner signs (deploy through the CREATE2 deployer with a mined salt, create the game pool, name the operator). The tests are the v2 suites carried over to v2.1, with the shield and burn tests rewritten: `forge test --match-contract SherwoodV21` (188 tests).
