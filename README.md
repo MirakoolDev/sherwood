@@ -192,3 +192,7 @@ Deployed on Robinhood Chain at [`0xbdA0Bc2461c2f0706573878F2932F87526b43D63`](ht
 Deployed on Robinhood Chain at [`0x45aC5C394f4fD8194fC4868c63A75d606a8A20CC`](https://robinhoodchain.blockscout.com/address/0x45aC5C394f4fD8194fC4868c63A75d606a8A20CC) for $WIF (`0x5173b8eA6923c2d40267890D45C46a3480954773`), with $PFWA as the host token. Rounds started at GENESIS `1793008800` (2026-10-26 10:00 UTC). Play at [sherwood.pfwa.fun/wif](https://sherwood.pfwa.fun/wif); the guide is at [sherwood.pfwa.fun/wif/docs](https://sherwood.pfwa.fun/wif/docs).
 
 [`script/PlanSherwoodV21.s.sol`](script/PlanSherwoodV21.s.sol) plans the three transactions the owner signs (deploy through the CREATE2 deployer with a mined salt, create the game pool, name the operator). The tests are the v2 suites carried over to v2.1, with the shield and burn tests rewritten: `forge test --match-contract SherwoodV21` (188 tests).
+
+## HoodRand: verifiable randomness for Robinhood Chain
+
+[`hoodrand/`](hoodrand/) is HoodRand, live at [`0xbE5105faf1Cb76733876959d5802448d066D734F`](https://robinhoodchain.blockscout.com/address/0xbE5105faf1Cb76733876959d5802448d066D734F). It turns drand's evmnet beacon (the League of Entropy, a new BLS signature every 3 seconds) into random numbers checked onchain with Robinhood Chain's BN254 pairing precompile, so nobody, PFWA included, can predict or bias a result. It has the same interface as Dice Protocol and Pyth Entropy, so contracts built for them work unchanged. Fee: 0.00002 ETH a request. See [`hoodrand/README.md`](hoodrand/README.md).
