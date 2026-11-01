@@ -1,6 +1,6 @@
 # Sherwood
 
-A daily leaderboard game on a Uniswap v4 hook, on Robinhood Chain (chain ID 4663). Every move is a buy of
+A PvP game on Robinhood Chain (chain ID 4663). This section is Season 1, the first version: a daily game on a Uniswap v4 hook. Every move is a buy of
 $PFWA in one ETH/$PFWA pool; the hook keeps the score, the pot and the payouts onchain. The whole game is
 one contract: [`src/Sherwood.sol`](src/Sherwood.sol).
 
@@ -192,6 +192,52 @@ Deployed on Robinhood Chain at [`0xbdA0Bc2461c2f0706573878F2932F87526b43D63`](ht
 Deployed on Robinhood Chain at [`0x45aC5C394f4fD8194fC4868c63A75d606a8A20CC`](https://robinhoodchain.blockscout.com/address/0x45aC5C394f4fD8194fC4868c63A75d606a8A20CC) for $WIF (`0x5173b8eA6923c2d40267890D45C46a3480954773`), with $PFWA as the host token. Rounds started at GENESIS `1793008800` (2026-10-26 10:00 UTC). Play at [sherwood.pfwa.fun/wif](https://sherwood.pfwa.fun/wif); the guide is at [sherwood.pfwa.fun/wif/docs](https://sherwood.pfwa.fun/wif/docs).
 
 [`script/PlanSherwoodV21.s.sol`](script/PlanSherwoodV21.s.sol) plans the three transactions the owner signs (deploy through the CREATE2 deployer with a mined salt, create the game pool, name the operator). The tests are the v2 suites carried over to v2.1, with the shield and burn tests rewritten: `forge test --match-contract SherwoodV21` (188 tests).
+
+## The arena on Hookr ($PFWA)
+
+[`src/SherwoodArena.sol`](src/SherwoodArena.sol) brings the $PFWA game back as a plain contract instead of a hook. The market is an ETH/$PFWA pool on [Hookr](https://hookr.fun)'s root hook (arb recapture on, a 6.25% buy tax); the game is ours. Each move is `play(move, minOut, referrer)`: the arena buys $PFWA with all the ETH sent, through Hookr's router, sends it straight to the player and scores the move with v2.1's rules (charges, shield blocks, King of the Hill).
+
+### What changed from v2.1
+
+- **The player is `msg.sender`**, not `tx.origin`, so a wallet, an agent or another contract can play.
+- **Only arena moves score.** Buys made anywhere else score nothing, but they still pay the buy tax into the pot.
+- **Selling** isn't seen by the arena, so it doesn't wipe points. It costs at settlement instead: a winner holding less $PFWA than the round's moves bought keeps only that share of the prize, and the rest rolls into the live pot.
+- **Rounds** are 1 hour at launch. The owner can set 5 min, 15 min, 30 min, 1 h or 20 h, from the next round boundary on; the round being played keeps its end.
+- **Flip** uses [HoodRand](hoodrand/) and can be switched off by the owner (a FLIP then plays as a BUY).
+- **The pot** is fed by the buy tax (paid to the pot vault, which forwards it to the arena), the trader share of arb recapture (credited to the router adapter, which passes it on), ETH anyone sends, and half of $PFWA's Pons creator-fee ETH through the fee splitter. There is no play fee (`playFeeBps` is 0).
+- **Split**, fixed in the contract:
+
+  | Share | Goes to |
+  |---|---|
+  | 40% / 20% / 10% | Top 3 |
+  | 8% | King of the Hill |
+  | 17% | Buys $PFWA through Hookr's router and burns it (`buybackAndBurn`, to `0x…dEaD`) |
+  | 5% | Rollover |
+
+### Contracts (Robinhood Chain, all verified)
+
+| Contract | Address | Role |
+| --- | --- | --- |
+| [`SherwoodArena`](src/SherwoodArena.sol) | [`0x097AcFfB2B247d9492983b3eb1F4a57820D1BAD1`](https://robinhoodchain.blockscout.com/address/0x097AcFfB2B247d9492983b3eb1F4a57820D1BAD1) | The game. GENESIS `1793631600` (2026-11-02 15:00 UTC) |
+| [`SherwoodPotVault`](src/SherwoodPotVault.sol) | [`0x77BC34F3669Ff7dd41C9C2Ca8F0201022f3Cbc68`](https://robinhoodchain.blockscout.com/address/0x77BC34F3669Ff7dd41C9C2Ca8F0201022f3Cbc68) | The pool's buy-tax recipient; forwards every wei to the arena |
+| [`HookrRouterAdapter`](src/HookrRouterAdapter.sol) | [`0x195554e3ec0678bF34e37b0E9aBdc5C0b5d89D52`](https://robinhoodchain.blockscout.com/address/0x195554e3ec0678bF34e37b0E9aBdc5C0b5d89D52) | The arena's one swap, through Hookr's router; bound to the arena once |
+| [`SherwoodArenaDeployer`](src/SherwoodArenaDeployer.sol) | [`0xF178379a521bCc695c3896FD01bCD65b18239D9d`](https://robinhoodchain.blockscout.com/address/0xF178379a521bCc695c3896FD01bCD65b18239D9d) | Deployed the three above, wired together, in one transaction |
+| [`PonsFeeSplitter`](src/PonsFeeSplitter.sol) | [`0x9C5d8E94343D51bB3656b068E4a91A7c3c50606e`](https://robinhoodchain.blockscout.com/address/0x9C5d8E94343D51bB3656b068E4a91A7c3c50606e) | Collects $PFWA's Pons fees; once a day sends a share of the ETH (half to start) to the pot vault and the rest, with all the $PFWA, to the treasury |
+
+### Roles and trust
+
+| Role | Can | Cannot |
+| --- | --- | --- |
+| Arena owner | `setOwner`/`acceptOwner`, `setOperator`, `setFlipsEnabled`, `setRoundLength` (from the next round), `setTaxQueue` (once) | Touch pots, points, prizes, referral earnings or the split |
+| Operator | `buybackAndBurn(amount, minOut)` from the burn reserve; `refundDiceRequest` | Send reserve ETH anywhere but a $PFWA buy that goes to `0x…dEaD` |
+| Vault owner | `proposeArena(next)`, `cancelSwitch()` | Switch the arena before `SWITCH_DELAY` (2 days) has passed, or send the tax anywhere but the current arena |
+| Anyone | `play`, `settle`, `claim`, `sweepUnclaimed`, `fundPot`, `pullTax`, `flush` on the vault, `switchArena()` once a proposal is due | — |
+
+The pool's tax recipient is fixed by Hookr at launch, so it is the vault, not the arena. A fixed or upgraded arena replaces this one without a new pool: the owner proposes it on the vault, and after 2 days anyone completes the switch, so players see it coming.
+
+### Tests
+
+`forge test --match-contract "SherwoodArena|SherwoodPotVault|PonsFeeSplitter"`: the v2.1 suites carried over to the arena, plus the router, tax, slippage, re-entry, contract-player, round-length and vault tests, and fork tests against Hookr's router and the Pons locker (232 tests; the Pons fork test skips when no fees are owed at the latest block).
 
 ## HoodRand: verifiable randomness for Robinhood Chain
 
