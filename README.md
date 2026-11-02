@@ -219,17 +219,17 @@ Deployed on Robinhood Chain at [`0x45aC5C394f4fD8194fC4868c63A75d606a8A20CC`](ht
 
 ### Contracts (Robinhood Chain)
 
-The arena is being redeployed with the fixes from the security review below; round 1 starts on 2026-11-03 at 15:00 UTC (GENESIS `1793718000`). The deploy goes through the CREATE2 proxy, so its addresses are known in advance:
+Redeployed on 2026-11-02 with the fixes from the security review below, all verified (Sourcify, shown on Blockscout); round 1 starts on 2026-11-03 at 15:00 UTC (GENESIS `1793718000`), in 20-hour rounds:
 
 | Contract | Address | Role |
 | --- | --- | --- |
-| [`SherwoodArena`](src/SherwoodArena.sol) | `0x817063839b465823180BedC11601681A42E7d92f` (pending) | The game |
-| [`SherwoodPotVault`](src/SherwoodPotVault.sol) | `0xE0bF87424bBdBCBABf1d9A30B34671C3282eff1B` (pending) | The pool's buy-tax recipient; forwards every wei to the arena |
-| [`HookrRouterAdapter`](src/HookrRouterAdapter.sol) | `0x2507Fe3b9D792B63F10B96B617916ce611a2d48d` (pending) | The arena's one swap, through Hookr's router; bound to the arena once |
-| [`SherwoodArenaDeployer`](src/SherwoodArenaDeployer.sol) | `0x8Cbe9083cb12C316eBe96a005D0C9e17A7BF1961` (pending) | Deploys the three above, wired together, in one transaction |
+| [`SherwoodArena`](src/SherwoodArena.sol) | [`0x817063839b465823180BedC11601681A42E7d92f`](https://robinhoodchain.blockscout.com/address/0x817063839b465823180BedC11601681A42E7d92f) | The game |
+| [`SherwoodPotVault`](src/SherwoodPotVault.sol) | [`0xE0bF87424bBdBCBABf1d9A30B34671C3282eff1B`](https://robinhoodchain.blockscout.com/address/0xE0bF87424bBdBCBABf1d9A30B34671C3282eff1B) | The pool's buy-tax recipient; forwards every wei to the arena |
+| [`HookrRouterAdapter`](src/HookrRouterAdapter.sol) | [`0x2507Fe3b9D792B63F10B96B617916ce611a2d48d`](https://robinhoodchain.blockscout.com/address/0x2507Fe3b9D792B63F10B96B617916ce611a2d48d) | The arena's one swap, through Hookr's router; bound to the arena once |
+| [`SherwoodArenaDeployer`](src/SherwoodArenaDeployer.sol) | [`0x8Cbe9083cb12C316eBe96a005D0C9e17A7BF1961`](https://robinhoodchain.blockscout.com/address/0x8Cbe9083cb12C316eBe96a005D0C9e17A7BF1961) | Deploys the three above, wired together, in one transaction |
 | [`PonsFeeSplitter`](src/PonsFeeSplitter.sol) | [`0x9C5d8E94343D51bB3656b068E4a91A7c3c50606e`](https://robinhoodchain.blockscout.com/address/0x9C5d8E94343D51bB3656b068E4a91A7c3c50606e) | Collects $PFWA's Pons fees; once a day sends a share of the ETH (half to start) to the pot vault and the rest, with all the $PFWA, to the treasury |
 
-Retired before launch, never played: arena [`0x097AcFfB2B247d9492983b3eb1F4a57820D1BAD1`](https://robinhoodchain.blockscout.com/address/0x097AcFfB2B247d9492983b3eb1F4a57820D1BAD1), vault [`0x77BC34F3669Ff7dd41C9C2Ca8F0201022f3Cbc68`](https://robinhoodchain.blockscout.com/address/0x77BC34F3669Ff7dd41C9C2Ca8F0201022f3Cbc68), adapter [`0x195554e3ec0678bF34e37b0E9aBdc5C0b5d89D52`](https://robinhoodchain.blockscout.com/address/0x195554e3ec0678bF34e37b0E9aBdc5C0b5d89D52) and deployer [`0xF178379a521bCc695c3896FD01bCD65b18239D9d`](https://robinhoodchain.blockscout.com/address/0xF178379a521bCc695c3896FD01bCD65b18239D9d) (GENESIS `1793631600`).
+Retired before launch, never played: arena [`0x097AcFfB2B247d9492983b3eb1F4a57820D1BAD1`](https://robinhoodchain.blockscout.com/address/0x097AcFfB2B247d9492983b3eb1F4a57820D1BAD1), vault [`0x77BC34F3669Ff7dd41C9C2Ca8F0201022f3Cbc68`](https://robinhoodchain.blockscout.com/address/0x77BC34F3669Ff7dd41C9C2Ca8F0201022f3Cbc68), adapter [`0x195554e3ec0678bF34e37b0E9aBdc5C0b5d89D52`](https://robinhoodchain.blockscout.com/address/0x195554e3ec0678bF34e37b0E9aBdc5C0b5d89D52) and deployer [`0xF178379a521bCc695c3896FD01bCD65b18239D9d`](https://robinhoodchain.blockscout.com/address/0xF178379a521bCc695c3896FD01bCD65b18239D9d) (GENESIS `1793631600`); and a build from before the 10% burn, deployed from a stale launch page and never wired to a pool: arena [`0xd87248001fD0732d1a56d6f69fcfDb58E2Df2d62`](https://robinhoodchain.blockscout.com/address/0xd87248001fD0732d1a56d6f69fcfDb58E2Df2d62), vault [`0x9621693D1bbdef13b9bc3CEF0F4Bb882fa0824d5`](https://robinhoodchain.blockscout.com/address/0x9621693D1bbdef13b9bc3CEF0F4Bb882fa0824d5).
 
 ### Security review (Nov 2026)
 
