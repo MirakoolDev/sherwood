@@ -22,7 +22,7 @@ contract SherwoodArenaInvariantTest is SherwoodArenaFixture {
         handler.buy(1, 0.1 ether, 0, 0);
         handler.buy(2, 0.08 ether, 0, 0);
         handler.buy(3, 0.05 ether, 3, 0);
-        handler.advance(game.ROUND_LENGTH() + game.SETTLE_DELAY());
+        handler.advance(1 days); // past round 0's settlement and the flip's timeout
         handler.settleRound(0, 6);
         handler.claim(0, 1, false);
         handler.claim(0, 0, true);
@@ -33,7 +33,7 @@ contract SherwoodArenaInvariantTest is SherwoodArenaFixture {
         handler.buy(0, 0.01 ether, 2, 0);
         handler.buy(1, 0.01 ether, 3, 0);
 
-        bytes4[] memory selectors = new bytes4[](13);
+        bytes4[] memory selectors = new bytes4[](15);
         selectors[0] = handler.buy.selector;
         selectors[1] = handler.sell.selector;
         selectors[2] = handler.fund.selector;
@@ -47,6 +47,8 @@ contract SherwoodArenaInvariantTest is SherwoodArenaFixture {
         selectors[10] = handler.burn.selector;
         selectors[11] = handler.refund.selector;
         selectors[12] = handler.pushTax.selector;
+        selectors[13] = handler.withdraw.selector;
+        selectors[14] = handler.sendSpare.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector(address(handler), selectors));
     }
@@ -164,8 +166,19 @@ contract SherwoodArenaInvariantTest is SherwoodArenaFixture {
         if (leader != address(0)) assertGt(leading, 0);
     }
 
+    /// The arena's token balance backs every player's holdings, and the running total is their sum.
+    function invariant_tokensBackEveryHolding() public view {
+        assertEq(game.totalHoldings(), handler.sumHoldings(), "totalHoldings is the sum of all holdings");
+        assertGe(gameToken.balanceOf(address(game)), game.totalHoldings(), "every holding is backed by tokens");
+        // Nothing in this campaign sends tokens to the arena except its own buys: it holds the holdings
+        // plus what the buybacks kept, exactly.
+        assertEq(gameToken.balanceOf(address(game)), game.totalHoldings() + handler.keptTokens());
+        assertEq(game.spareTokens(), handler.keptTokens());
+    }
+
     function test_handlerExercisesRecoveryClaimsAndSweeps() public {
         handler.resolve(2, false, false);
+        handler.withdraw(4, 1);
         handler.sell(4, 1);
         handler.burn(1 ether, true, false);
         handler.advance(3 * game.ROUND_LENGTH());
@@ -174,6 +187,7 @@ contract SherwoodArenaInvariantTest is SherwoodArenaFixture {
         handler.sweep(0);
         assertGt(handler.buys(), 0);
         assertGt(handler.sells(), 0);
+        assertGt(handler.withdrawals(), 0);
         assertGt(handler.settledRounds(), 0);
         assertGt(handler.prizeClaims(), 0);
         assertGt(handler.referralClaims(), 0);
@@ -188,5 +202,6 @@ contract SherwoodArenaInvariantTest is SherwoodArenaFixture {
         invariant_finalWinnersMatchScoresAndReignDurations();
         invariant_pendingFlipCountersMatchLiveRequests();
         invariant_chargeViewsAndReignsStayConsistent();
+        invariant_tokensBackEveryHolding();
     }
 }

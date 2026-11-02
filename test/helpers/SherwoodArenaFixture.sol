@@ -158,7 +158,7 @@ abstract contract SherwoodArenaFixture is Test {
     address internal constant DEAD = 0x000000000000000000000000000000000000dEaD;
     uint256 internal constant MIN_BUY = 0.001 ether;
     uint256 internal constant MAX_DICE_FEE = 0.0005 ether;
-    uint256 internal constant FLIP_TIMEOUT = 10 minutes;
+    uint256 internal constant FLIP_TIMEOUT = 1 days;
     uint256 internal constant CLAIM_WINDOW = 7 days;
     address internal owner;
     address internal alice;
@@ -210,8 +210,11 @@ abstract contract SherwoodArenaFixture is Test {
         _play(who, amount, move > 255 ? 255 : uint8(move), ref);
     }
 
-    /// A sell anywhere: the arena can't see it, the player's balance just drops.
+    /// A sell: the player withdraws `amount` from their holdings and sells it elsewhere (the arena only
+    /// sees the withdraw).
     function _sell(address who, uint256 amount) internal {
+        vm.prank(who);
+        game.withdraw(amount);
         gameToken.burn(who, amount);
     }
 

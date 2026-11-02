@@ -183,10 +183,19 @@ contract SherwoodArenaTest is Test {
         _play(hook, who, amount, uint8(move), ref);
     }
 
-    /// A sell anywhere: the arena can't see it; the player's balance just drops.
+    /// A sell: the player withdraws from their holdings (capped at what they have) and sells the tokens
+    /// elsewhere; the arena only sees the withdraw.
     function _sell(address who, uint256 amount) internal {
-        uint256 bal = gameToken.balanceOf(who);
-        gameToken.burn(who, amount < bal ? amount : bal);
+        uint256 out = _withdraw(who, amount);
+        gameToken.burn(who, out);
+    }
+
+    /// Moves `amount` of `who`'s holdings (capped) to their wallet. Returns what moved.
+    function _withdraw(address who, uint256 amount) internal returns (uint256 out) {
+        uint256 held = hook.holdings(who);
+        out = amount < held ? amount : held;
+        vm.prank(who);
+        hook.withdraw(amount);
     }
 
     function _round() internal view returns (uint256) {
@@ -243,12 +252,18 @@ contract SherwoodArenaTest is Test {
     }
 
     function test_buyerReceivesPfwaForEthAfterFee() public {
-        uint256 before = gameToken.balanceOf(alice);
         _buy(alice, 0.1 ether, SherwoodArena.Move.BUY);
-        // The mock router pays 1 token per ETH: the player gets the 95% the play fee leaves.
-        assertEq(gameToken.balanceOf(alice) - before, 0.095 ether);
+        // The mock router pays 1 token per ETH: the player's holdings get the 95% the play fee leaves,
+        // kept by the arena until she withdraws.
+        assertEq(hook.holdings(alice), 0.095 ether);
+        assertEq(hook.totalHoldings(), 0.095 ether);
+        assertEq(gameToken.balanceOf(address(hook)), 0.095 ether);
+        assertEq(gameToken.balanceOf(alice), 0);
         assertEq(hook.bought(_round(), alice), 0.095 ether);
         assertEq(address(arenaRouter).balance, 0.095 ether);
+        vm.prank(alice);
+        hook.withdraw(0.095 ether);
+        assertEq(gameToken.balanceOf(alice), 0.095 ether);
     }
 
     // ── Rounds ──────────────────────────────────────────────────────────────────
@@ -286,7 +301,7 @@ contract SherwoodArenaTest is Test {
         assertEq(late.currentRound(), 0);
         _play(late, alice, 0.05 ether, uint8(SherwoodArena.Move.BUY), carol);
         assertEq(late.pot(0), 0.0025 ether); // the fee lands in round 0
-        assertEq(gameToken.balanceOf(alice), 0.0475 ether); // the buy still happens
+        assertEq(late.holdings(alice), 0.0475 ether); // the buy still happens, into her holdings
         assertEq(late.points(0, alice), 0); // nothing scored
         assertEq(late.bought(0, alice), 0); // and no holding rules on it
         assertEq(late.playerCount(0), 0);
@@ -456,14 +471,46 @@ contract SherwoodArenaTest is Test {
     }
 
     function test_unrevealedFlipExpiresAsPlainBuy() public {
+        uint256 round = _round();
+        uint256 t0 = vm.getBlockTimestamp();
         _buy(bob, 0.02 ether, SherwoodArena.Move.FLIP);
         vm.expectRevert(SherwoodArena.FlipNotExpired.selector);
         hook.expireFlip(1);
-        vm.warp(vm.getBlockTimestamp() + 10 minutes);
+        vm.warp(t0 + 1 days); // HoodRand's refund window, well past the round
         hook.expireFlip(1);
-        assertEq(hook.points(_round(), bob), 20);
+        assertEq(hook.points(round, bob), 20);
         dice.reveal(1, bytes32(uint256(2))); // a late reveal does nothing
-        assertEq(hook.points(_round(), bob), 20);
+        assertEq(hook.points(round, bob), 20);
+    }
+
+    function test_flipUnrevealedAtTenMinutesOrADayLessOneSecondCannotExpire() public {
+        uint256 t0 = vm.getBlockTimestamp();
+        _buy(bob, 0.02 ether, SherwoodArena.Move.FLIP);
+        vm.warp(t0 + 10 minutes); // the old timeout: a flipper could have let a known loss expire here
+        vm.expectRevert(SherwoodArena.FlipNotExpired.selector);
+        hook.expireFlip(1);
+        vm.warp(t0 + 1 days - 1);
+        vm.expectRevert(SherwoodArena.FlipNotExpired.selector);
+        hook.expireFlip(1);
+        assertEq(hook.pendingFlips(0), 1);
+        vm.warp(t0 + 1 days);
+        hook.expireFlip(1);
+        assertEq(hook.pendingFlips(0), 0);
+        assertEq(hook.points(0, bob), 20); // scored as a plain buy
+    }
+
+    function test_flipRevealedBeforeTheDayResolvesNormally() public {
+        uint256 t0 = vm.getBlockTimestamp();
+        _buy(alice, 0.01 ether, SherwoodArena.Move.BUY);
+        _buy(bob, 0.02 ether, SherwoodArena.Move.FLIP); // previous alice
+        vm.warp(t0 + 1 days - 1);
+        dice.reveal(1, bytes32(uint256(3))); // a loss: bob pays his 20 stake to alice
+        assertEq(hook.points(0, bob), -20);
+        assertEq(hook.points(0, alice), 30);
+        assertEq(hook.pendingFlips(0), 0);
+        vm.warp(t0 + 1 days);
+        vm.expectRevert(SherwoodArena.FlipNotExpired.selector); // nothing left to expire
+        hook.expireFlip(1);
     }
 
     function test_flipScoresAsBuyWhenDiceRefuses() public {
@@ -874,10 +921,11 @@ contract SherwoodArenaTest is Test {
         uint256 t0 = vm.getBlockTimestamp();
         _buy(alice, 0.03 ether, SherwoodArena.Move.BUY);
         _buy(bob, 0.05 ether, SherwoodArena.Move.FLIP);
-        vm.warp(t0 + 10 minutes);
+        vm.warp(t0 + 1 days); // past round 0's end: the reign clock stops there
         hook.expireFlip(1); // bob 50
         assertEq(hook.reignHolder(0), bob);
-        assertEq(hook.reignOf(0, alice), 10 minutes);
+        assertEq(hook.reignOf(0, alice), hook.roundEnd(0) - t0); // alice held #1 for the rest of the round
+        assertEq(hook.reignOf(0, bob), 0); // bob took it at the round's end
     }
 
     function test_reignCanBeVacant() public {
@@ -938,10 +986,13 @@ contract SherwoodArenaTest is Test {
         assertEq(hook.SECOND_BPS(), 2000);
         assertEq(hook.THIRD_BPS(), 1000);
         assertEq(hook.KING_BPS(), 800);
-        assertEq(hook.BURN_BPS(), 1700); // v2.1's 10% plus the 7% host burn, burning $PFWA together
+        assertEq(hook.BUYBACK_BPS(), 1700); // buys $PFWA: 10% of the pot is burned, 7% kept
+        assertEq(hook.BURN_BPS(), 1000);
+        assertEq(hook.KEEP_BPS(), 700);
+        assertEq(hook.BURN_BPS() + hook.KEEP_BPS(), hook.BUYBACK_BPS());
         assertEq(hook.ROLLOVER_BPS(), 500);
         assertEq(
-            hook.FIRST_BPS() + hook.SECOND_BPS() + hook.THIRD_BPS() + hook.KING_BPS() + hook.BURN_BPS()
+            hook.FIRST_BPS() + hook.SECOND_BPS() + hook.THIRD_BPS() + hook.KING_BPS() + hook.BUYBACK_BPS()
                 + hook.ROLLOVER_BPS(),
             10_000
         );
@@ -1235,8 +1286,12 @@ contract SherwoodArenaTest is Test {
     function test_flipRevealedAfterSettlementIsIgnored() public {
         uint256 round = _round();
         _buy(alice, 0.02 ether, SherwoodArena.Move.BUY);
+        uint256 requestedAt = vm.getBlockTimestamp();
         _buy(bob, 0.02 ether, SherwoodArena.Move.FLIP);
         vm.warp(_settleTime(round));
+        vm.expectRevert(SherwoodArena.FlipsPending.selector);
+        hook.settle(round, 100);
+        vm.warp(requestedAt + 1 days); // a day after the request: past the settlement opening
         hook.expireFlip(1); // settlement waits for this; the flip scores as a plain buy
         hook.settle(round, 100);
         dice.reveal(1, bytes32(uint256(2))); // Dice reveals late: nothing changes
@@ -1326,16 +1381,14 @@ contract SherwoodArenaTest is Test {
         hook.settle(round, 100);
         uint256 held = hook.heldToClaim(round, alice);
         assertEq(held, hook.bought(round, alice));
-        vm.prank(alice);
-        gameToken.transfer(carol, 1); // sold a little after settlement
+        _sell(alice, 1); // sold a little after settlement
         vm.prank(alice);
         vm.expectRevert(SherwoodArena.MustHoldToClaim.selector); // neither prize goes out
         hook.claim(round);
         (,,,, bool[3] memory claimed,,,, bool kingClaimed) = hook.result(round);
         assertFalse(claimed[1]);
         assertFalse(kingClaimed);
-        vm.prank(carol);
-        gameToken.transfer(alice, 1); // bought back
+        _buy(alice, 0.0005 ether, SherwoodArena.Move.BUY); // bought back through the arena (unscored)
         uint256 before = alice.balance;
         vm.prank(alice);
         hook.claim(round);
@@ -1346,14 +1399,20 @@ contract SherwoodArenaTest is Test {
         uint256 round = _kingNotFirst(true); // alice King only
         vm.warp(_settleTime(round));
         hook.settle(round, 100);
-        uint256 held = gameToken.balanceOf(alice);
+        uint256 held = hook.holdings(alice);
+        _withdraw(alice, held);
         vm.prank(alice);
         gameToken.transfer(bob, held); // sold everything after settlement
         vm.prank(alice);
         vm.expectRevert(SherwoodArena.MustHoldToClaim.selector);
         hook.claim(round);
         vm.prank(bob);
-        gameToken.transfer(alice, held); // bought back within the window
+        gameToken.transfer(alice, held); // back in her wallet: doesn't count
+        vm.prank(alice);
+        vm.expectRevert(SherwoodArena.MustHoldToClaim.selector);
+        hook.claim(round);
+        _buy(alice, 0.01 ether, SherwoodArena.Move.BUY); // bought back through the arena within the window
+        assertGe(hook.holdings(alice), hook.heldToClaim(round, alice));
         uint256 before = alice.balance;
         vm.prank(alice);
         hook.claim(round);
@@ -1365,8 +1424,7 @@ contract SherwoodArenaTest is Test {
         uint256 total = hook.pot(round);
         uint256 owed = hook.bought(round, alice);
         uint256 sold = owed / 4;
-        vm.prank(alice);
-        gameToken.transfer(carol, sold); // sold 25% of the round's buys
+        _sell(alice, sold); // sold 25% of the round's buys
         vm.warp(_settleTime(round));
         uint256 nextBefore = hook.pot(round + 1);
         hook.settle(round, 100);
@@ -1390,9 +1448,7 @@ contract SherwoodArenaTest is Test {
     function test_kingWhoSoldEverythingGetsNothing() public {
         uint256 round = _kingNotFirst(true);
         uint256 total = hook.pot(round);
-        vm.startPrank(alice);
-        gameToken.transfer(carol, gameToken.balanceOf(alice));
-        vm.stopPrank();
+        _sell(alice, hook.holdings(alice));
         vm.warp(_settleTime(round));
         uint256 nextBefore = hook.pot(round + 1);
         hook.settle(round, 100);
@@ -1480,7 +1536,8 @@ contract SherwoodArenaTest is Test {
         address last = hook.lastPlayer(live);
         vm.prank(owner);
         hook.buybackAndBurn(reserve, 1);
-        assertEq(gameToken.balanceOf(DEAD), reserve, "1:1 at the mock router, all of it burned");
+        assertEq(gameToken.balanceOf(DEAD), (reserve * 1000) / 1700, "1:1 at the mock router, 10/17 of it burned");
+        assertEq(hook.spareTokens(), reserve - (reserve * 1000) / 1700, "the other 7/17 kept in the arena");
         assertEq(hook.buybackReserve(), 0);
         assertEq(hook.pot(live), potBefore, "no play fee on the burn");
         assertEq(hook.points(live, owner), 0, "the operator doesn't score");
@@ -1596,29 +1653,54 @@ contract SherwoodArenaTest is Test {
     function test_buysAreRecordedPerRound() public {
         _buy(alice, 0.01 ether, SherwoodArena.Move.BUY);
         assertGt(hook.bought(_round(), alice), 0);
-        assertEq(hook.bought(_round(), alice), gameToken.balanceOf(alice));
+        assertEq(hook.bought(_round(), alice), hook.holdings(alice));
+        assertEq(gameToken.balanceOf(alice), 0); // the arena keeps the tokens
     }
 
-    function test_holdingRuleUsesBalanceAtSettlement() public {
+    function test_holdingRuleUsesHoldingsAtSettlement() public {
         uint256 round = _round();
         _buy(alice, 0.05 ether, SherwoodArena.Move.BUY);
-        uint256 held = gameToken.balanceOf(alice);
+        uint256 held = hook.holdings(alice);
+        _withdraw(alice, held);
         vm.prank(alice);
         gameToken.transfer(bob, held); // "sold" somewhere else during the round...
         vm.warp(_settleTime(round) - 1);
         vm.prank(bob);
-        gameToken.transfer(alice, held); // ...and bought back before settlement: counts as held
+        gameToken.transfer(alice, held); // ...and back in her wallet before settlement: doesn't count
+        _buy(alice, 0.0009 ether, SherwoodArena.Move.BUY); // a small unscored buy back through the arena
+        uint256 rebought = hook.holdings(alice);
+        assertLt(rebought, held);
         vm.warp(_settleTime(round));
-        hook.settle(round, 100);
         uint256 total = hook.pot(round);
-        assertEq(hook.heldToClaim(round, alice), held);
+        hook.settle(round, 100);
+        // She keeps the share of her round's buys her holdings cover at settlement, nothing for the wallet.
+        assertEq(hook.heldToClaim(round, alice), rebought);
+        (,,, uint256[3] memory prize,,,,,) = hook.result(round);
+        assertEq(prize[0], _bps(total, 4000) * rebought / held);
         uint256 before = alice.balance;
         vm.prank(alice);
         hook.claim(round);
-        assertEq(alice.balance - before, _bps(total, 4000) + _bps(total, 800));
-        vm.prank(alice);
-        gameToken.transfer(bob, held); // selling after claiming changes nothing
-        assertEq(alice.balance - before, _bps(total, 4000) + _bps(total, 800));
+        assertEq(alice.balance - before, prize[0] + _kingPrize(round));
+        _withdraw(alice, rebought); // withdrawing after claiming changes nothing
+        assertEq(alice.balance - before, prize[0] + _kingPrize(round));
+    }
+
+    function test_holdingRuleCountsBuysBackThroughTheArena() public {
+        uint256 round = _round();
+        _buy(alice, 0.05 ether, SherwoodArena.Move.BUY);
+        uint256 held = hook.holdings(alice);
+        _sell(alice, held); // sold during the round...
+        _buy(alice, 0.05 ether, SherwoodArena.Move.BUY); // ...and bought back by playing again
+        assertEq(hook.holdings(alice), held);
+        assertEq(hook.bought(round, alice), 2 * held); // the second buy is owed too
+        _buy(alice, 0.0009 ether, SherwoodArena.Move.BUY); // unscored: holdings only
+        vm.warp(_settleTime(round));
+        uint256 total = hook.pot(round);
+        hook.settle(round, 100);
+        uint256 h = hook.holdings(alice);
+        (,,, uint256[3] memory prize,,,,,) = hook.result(round);
+        assertEq(prize[0], _bps(total, 4000) * h / (2 * held)); // she holds about half of what she bought
+        assertEq(hook.heldToClaim(round, alice), h);
     }
 
     function test_winnerMustHoldThatRoundsBuysToClaim() public {
@@ -1626,8 +1708,9 @@ contract SherwoodArenaTest is Test {
         _buy(alice, 0.05 ether, SherwoodArena.Move.BUY);
         vm.warp(_settleTime(round));
         hook.settle(round, 100);
-        uint256 held = gameToken.balanceOf(alice);
+        uint256 held = hook.holdings(alice);
 
+        _withdraw(alice, held);
         vm.prank(alice);
         gameToken.transfer(bob, held); // "sold" somewhere else
         vm.prank(alice);
@@ -1635,7 +1718,12 @@ contract SherwoodArenaTest is Test {
         hook.claim(round);
 
         vm.prank(bob);
-        gameToken.transfer(alice, held); // bought back
+        gameToken.transfer(alice, held); // back in her wallet: still not held
+        vm.prank(alice);
+        vm.expectRevert(SherwoodArena.MustHoldToClaim.selector);
+        hook.claim(round);
+
+        _buy(alice, 0.05 ether, SherwoodArena.Move.BUY); // bought back through the arena
         uint256 before = alice.balance;
         vm.prank(alice);
         hook.claim(round);
@@ -1646,21 +1734,18 @@ contract SherwoodArenaTest is Test {
         uint256 round = _round();
         _buy(alice, 0.05 ether, SherwoodArena.Move.BUY);
         uint256 owed = hook.bought(round, alice);
-        vm.prank(alice);
-        gameToken.transfer(carol, owed / 2); // sold half before settlement
+        _sell(alice, owed / 2); // sold half before settlement
         vm.warp(_settleTime(round));
         hook.settle(round, 100);
 
         assertEq(hook.heldToClaim(round, alice), owed - owed / 2);
         assertEq(hook.heldToClaim(round, bob), 0);
-        vm.prank(alice);
-        gameToken.transfer(carol, 1); // sold a little more after settlement
+        _sell(alice, 1); // sold a little more after settlement
         vm.prank(alice);
         vm.expectRevert(SherwoodArena.MustHoldToClaim.selector);
         hook.claim(round);
 
-        vm.prank(carol);
-        gameToken.transfer(alice, 1); // back to what she held at settlement
+        _buy(alice, 0.0005 ether, SherwoodArena.Move.BUY); // back above what she held at settlement
         uint256 before = alice.balance;
         vm.prank(alice);
         hook.claim(round);
@@ -1690,12 +1775,41 @@ contract SherwoodArenaTest is Test {
     function test_noHolderBonusAfterSellingLastRoundsBuys() public {
         uint256 round = _round();
         _buy(alice, 0.01 ether, SherwoodArena.Move.BUY);
-        uint256 held = gameToken.balanceOf(alice);
-        vm.prank(alice);
-        gameToken.transfer(bob, held / 2);
+        uint256 held = hook.holdings(alice);
+        _sell(alice, held / 2);
         _nextRound(round);
         _buy(alice, 0.01 ether, SherwoodArena.Move.BUY);
         assertEq(hook.points(round + 1, alice), 10);
+    }
+
+    function test_holderBonusKeptWhileHoldingsCoverLastRoundsBuys() public {
+        uint256 round = _round();
+        _buy(alice, 0.01 ether, SherwoodArena.Move.BUY);
+        _buy(alice, 0.0009 ether, SherwoodArena.Move.BUY); // unscored: holdings above the round's buys
+        uint256 extra = hook.holdings(alice) - hook.bought(round, alice);
+        _withdraw(alice, extra); // withdrawing only the extra keeps the bonus
+        _nextRound(round);
+        assertTrue(hook.holderBonusActive(round + 1, alice));
+        _withdraw(alice, 1); // one wei of last round's buys gone: no bonus
+        assertFalse(hook.holderBonusActive(round + 1, alice));
+        _buy(alice, 0.01 ether, SherwoodArena.Move.BUY);
+        assertEq(hook.points(round + 1, alice), 10);
+    }
+
+    function test_holderBonusNotRestoredByATransferToTheWallet() public {
+        uint256 round = _round();
+        _buy(alice, 0.01 ether, SherwoodArena.Move.BUY);
+        uint256 held = hook.holdings(alice);
+        _withdraw(alice, held);
+        _nextRound(round);
+        assertFalse(hook.holderBonusActive(round + 1, alice));
+        gameToken.mint(alice, 10 * held); // more than enough, but in her wallet
+        assertFalse(hook.holderBonusActive(round + 1, alice));
+        _buy(alice, 0.01 ether, SherwoodArena.Move.BUY); // scored before the buy lands: no bonus
+        assertEq(hook.points(round + 1, alice), 10);
+        assertTrue(hook.holderBonusActive(round + 1, alice)); // the play put last round's amount back
+        _buy(alice, 0.01 ether, SherwoodArena.Move.BUY);
+        assertEq(hook.points(round + 1, alice), 22);
     }
 
     function test_holderBonusNeedsLastRoundsPlay() public {
@@ -1741,10 +1855,14 @@ contract SherwoodArenaTest is Test {
 
     function test_expiredFlipsUnblockSettlement() public {
         uint256 round = _round();
+        uint256 requestedAt = vm.getBlockTimestamp();
         _buy(alice, 0.05 ether, SherwoodArena.Move.FLIP);
         vm.warp(_settleTime(round));
         vm.expectRevert(SherwoodArena.FlipsPending.selector);
         hook.settle(round, 10);
+        vm.expectRevert(SherwoodArena.FlipNotExpired.selector); // the round is over, the day isn't
+        hook.expireFlip(1);
+        vm.warp(requestedAt + 1 days);
         hook.expireFlip(1);
         assertTrue(hook.settle(round, 10));
         (, address[3] memory top,,,,,,,) = hook.result(round);
@@ -1817,9 +1935,7 @@ contract SherwoodArenaTest is Test {
         _buy(alice, 0.05 ether, SherwoodArena.Move.BUY); // #1 and King
         _buy(bob, 0.02 ether, SherwoodArena.Move.BUY); // #2
         uint256 total = hook.pot(round);
-        vm.startPrank(alice);
-        gameToken.transfer(carol, gameToken.balanceOf(alice)); // alice sold all of this round's buys
-        vm.stopPrank();
+        _sell(alice, hook.holdings(alice)); // alice withdrew and sold all of this round's buys
         vm.warp(_settleTime(round));
         uint256 nextBefore = hook.pot(round + 1);
         hook.settle(round, 100);
@@ -1842,8 +1958,7 @@ contract SherwoodArenaTest is Test {
         uint256 total = hook.pot(round);
         uint256 owed = hook.bought(round, alice);
         uint256 sold = owed / 5;
-        vm.prank(alice);
-        gameToken.transfer(carol, sold); // sold 20% of this round's buys
+        _sell(alice, sold); // withdrew and sold 20% of this round's buys
         vm.warp(_settleTime(round));
         uint256 nextBefore = hook.pot(round + 1);
         hook.settle(round, 100);
@@ -1955,8 +2070,7 @@ contract SherwoodArenaTest is Test {
         _buyRef(alice, 0.02 ether, SherwoodArena.Move.BUY, carol); // 20 x 1.1
         assertEq(hook.points(round, alice), 22);
         assertTrue(hook.welcomeBonusActive(round, alice));
-        vm.prank(alice);
-        gameToken.transfer(dave, 1); // no holder bonus next round either
+        _withdraw(alice, 1); // no holder bonus next round either
         _nextRound(round);
         assertFalse(hook.welcomeBonusActive(round + 1, alice));
         _buy(alice, 0.02 ether, SherwoodArena.Move.BUY);

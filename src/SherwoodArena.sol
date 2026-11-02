@@ -5,6 +5,10 @@ interface IBalanceOf {
     function balanceOf(address account) external view returns (uint256);
 }
 
+interface IArenaToken is IBalanceOf {
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
 /// @notice Dice Protocol randomness (a Pyth Entropy fork on Robinhood Chain).
 interface IDiceEntropy {
     function requestV2(address provider, bytes32 userRandomNumber, uint32 gasLimit)
@@ -34,22 +38,26 @@ interface IArenaTaxQueue {
 /// the $PFWA game on Hookr: the pool is an ETH/$PFWA pool on Hookr's root hook, every move buys through
 /// that pool's router (via IArenaRouter), and the pool's buy tax is paid into the pot. What changed:
 ///   1. A move is a call to play(), not a swap with hook data. The player is msg.sender (not
-///      tx.origin), so a wallet, an agent or another contract can play. The ETH sent buys $PFWA for the
-///      player through the router; an optional play fee (playFeeBps, at most 5%) is kept for the pot.
+///      tx.origin), so a wallet, an agent or another contract can play. The ETH sent buys $PFWA through
+///      the router and the arena keeps it for the player (holdings) until they withdraw it; an optional
+///      play fee (playFeeBps, at most 5%) is kept for the pot.
 ///   2. The pot is funded by the play fee, by ETH anyone sends (the pool's buy tax, pushed here), and by
 ///      fundPot seeding. Buys made elsewhere score nothing.
-///   3. Selling: the arena can't see sells, so a sell no longer wipes the seller's points. It costs them
-///      at settlement instead, as in v2.1: a winner holding less than they bought through the arena that
-///      round keeps only that share of the prize (sold 20%, lose 20%), and must still hold what they held
-///      at settlement to claim.
-///   4. The $PFWA game only: no host token. The 17% buyback burns $PFWA through the router.
+///   3. Selling: a sell starts with a withdraw(), which doesn't wipe points. It costs at settlement
+///      instead: a winner whose holdings are below what they bought through the arena that round keeps
+///      only that share of the prize (withdrew 20%, lose 20%), and must still have what they had at
+///      settlement to claim. The holder bonus reads holdings too. Holdings only grow through play() (no
+///      deposits), so tokens borrowed for one transaction (a v4 flash take) can't pass these checks,
+///      which a wallet balance could.
+///   4. The $PFWA game only: no host token. The 17% buyback buys $PFWA through the router and burns
+///      10/17 of it (10% of the pot); the rest (7%) stays here as spare tokens the owner can send on.
 ///   5. The owner can switch Flip off (flipsEnabled) while Dice Protocol is unreliable: a FLIP then plays
 ///      as a BUY and spends no charge.
 /// Everything else is v2.1, except that the round length is an owner setting (5 min to 20 h, from the next
 /// round boundary; v2.1's 20 h by default): 1 point per 0.001 ETH (up to 100 a move);
 /// BUY, STEAL, ROBIN_HOOD, FLIP and SHIELD with their charges and shield blocks; the holder, welcome and
 /// referral bonuses; King of the Hill; settlement 40/20/10% to the top three, 8% to the King, 17% to the
-/// burn, 5% (plus anything unawarded) rolled over; 7 days to claim.
+/// buyback (10% burned, 7% kept), 5% (plus anything unawarded) rolled over; 7 days to claim.
 contract SherwoodArena {
     // ── Game constants ──────────────────────────────────────────────────────────
     uint256 internal constant MAX_PLAY_FEE_BPS = 500;
@@ -70,7 +78,10 @@ contract SherwoodArena {
     uint256 internal constant RECENT = 10;
     uint256 public constant SETTLE_DELAY = 15 minutes;
     uint256 internal constant CLAIM_WINDOW = 7 days;
-    uint256 internal constant FLIP_TIMEOUT = 10 minutes;
+    // A HoodRand result is public once drand publishes its round (15 to 18 s after the request) and
+    // anyone can submit it, so an unanswered flip only expires once HoodRand would refund it: a short
+    // timeout would let a flipper reveal their wins and let their losses expire as buys.
+    uint256 internal constant FLIP_TIMEOUT = 1 days;
     uint256 internal constant MAX_SEED_AHEAD = 365;
     uint32 internal constant FLIP_CALLBACK_GAS = 200_000;
     // Hookr's queue pulls a pending claim with exactly 500,000 gas and needs about 513,000 at that point.
@@ -101,9 +112,12 @@ contract SherwoodArena {
     uint256 public constant SECOND_BPS = 2000;
     uint256 public constant THIRD_BPS = 1000;
     uint256 public constant KING_BPS = 800;
-    /// @notice Share of the pot that goes to the buyback reserve and burns $PFWA (v2.1's 10% plus the
-    /// 7% host burn, which in $PFWA's own game burns with it).
-    uint256 public constant BURN_BPS = 1700;
+    /// @notice Share of the pot that goes to the buyback reserve and buys $PFWA.
+    uint256 public constant BUYBACK_BPS = 1700;
+    /// @notice Of each pot, the share whose $PFWA is burned (10/17 of every buyback). The rest of what
+    /// the buyback buys (KEEP_BPS, 7% of the pot) stays in the arena as spare tokens.
+    uint256 public constant BURN_BPS = 1000;
+    uint256 public constant KEEP_BPS = 700;
     uint256 public constant ROLLOVER_BPS = 500;
 
     // Transient slots: 0 the reentrancy lock, 1 ETH credited to pots this transaction, 2 a router swap
@@ -121,8 +135,13 @@ contract SherwoodArena {
 
     // ── Wiring ──────────────────────────────────────────────────────────────────
     /// Tokens each player bought through the arena, per round: the settlement sell rule and the holder
-    /// bonus read it against the player's balance.
+    /// bonus read it against the player's holdings.
     mapping(uint256 round => mapping(address player => uint256)) public bought;
+    /// @notice The game token the arena keeps for each player: everything they bought through play(),
+    /// less what they withdrew.
+    mapping(address player => uint256) public holdings;
+    /// @notice The sum of all holdings (the arena's token balance is at least this).
+    uint256 public totalHoldings;
     mapping(address player => address) public referrerOf;
     mapping(address player => uint256) public firstRoundPlus1;
     mapping(address referrer => uint256) public referralEarnings;
@@ -231,8 +250,9 @@ contract SherwoodArena {
         address indexed target,
         uint256 pointsMoved
     );
-    /// @notice A move bought `tokenOut` for `player` (scored or not).
+    /// @notice A move bought `tokenOut` for `player` (scored or not), added to their holdings.
     event Bought(uint256 indexed round, address indexed player, uint256 ethSwapped, uint256 tokenOut);
+    event Withdrawn(address indexed player, uint256 amount);
     event FlipRequested(uint64 indexed sequence, uint256 indexed round, address indexed player, uint256 stake);
     event FlipResolved(uint64 indexed sequence, address indexed player, bool won, address paidTo, uint256 points);
     /// @notice ETH into a round's pot: a move's play fee, or ETH sent straight here (the pool's buy tax).
@@ -256,6 +276,9 @@ contract SherwoodArena {
     event ReferralClaimed(address indexed referrer, uint256 amount);
     event UnclaimedSwept(uint256 indexed round, uint256 amount);
     event BuybackBurned(uint256 ethIn, uint256 tokenBurned);
+    /// @notice The part of a buyback's $PFWA kept in the arena (spare tokens), not burned.
+    event BuybackKept(uint256 tokenKept);
+    event SpareTokensSent(address indexed to, uint256 amount);
     event OwnerChanged(address owner);
     event OwnerProposed(address pendingOwner);
     event OperatorChanged(address operator);
@@ -289,6 +312,7 @@ contract SherwoodArena {
     error TransferFailed();
     error TaxQueueAlreadySet();
     error BadRoundLength();
+    error NothingToWithdraw();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -440,9 +464,10 @@ contract SherwoodArena {
     // ── Moves ───────────────────────────────────────────────────────────────────
 
     /// @notice Plays `move` (0 BUY, 1 STEAL, 2 ROBIN_HOOD, 3 FLIP, 4 SHIELD; anything else is a BUY) with
-    /// the ETH sent: playFeeBps of it goes to the round's pot, the rest buys the token for the caller
-    /// through the router, reverting if that's less than `minOut` or doesn't spend all of it. `referrer`
-    /// counts on the caller's first play only (0 = none). Moves of at least 0.001 ETH score, from GENESIS.
+    /// the ETH sent: playFeeBps of it goes to the round's pot, the rest buys the token through the router
+    /// into the caller's holdings, reverting if that's less than `minOut` or doesn't spend all of it.
+    /// `referrer` counts on the caller's first play only (0 = none). Moves of at least 0.001 ETH score,
+    /// from GENESIS.
     function play(uint8 move, uint256 minOut, address referrer) external payable nonReentrant {
         _pullTax();
         uint256 ethIn = msg.value;
@@ -455,11 +480,31 @@ contract SherwoodArena {
         bool scores = ethIn >= MIN_BUY && block.timestamp >= GENESIS;
         // Scored before the swap, so the holder bonus reads what the player held before this buy.
         if (scores) _play(round, msg.sender, ethIn, move, referrer);
-        (uint256 out, uint256 refund) = _buy(ethIn - fee, minOut, msg.sender);
+        (uint256 out, uint256 refund) = _buy(ethIn - fee, minOut, address(this));
         // Points were scored on all of the ETH, so all of it must have been spent.
         if (refund > 0) revert PartialFill();
+        holdings[msg.sender] += out;
+        totalHoldings += out;
         if (scores) bought[round][msg.sender] += out;
         emit Bought(round, msg.sender, ethIn - fee, out);
+    }
+
+    /// @notice Sends `amount` of the caller's holdings (all of them if more) to the caller. Before a
+    /// round the caller won settles, this costs that share of the prize; after it, until they claim,
+    /// claim needs what they had at settlement.
+    function withdraw(uint256 amount) external nonReentrant {
+        uint256 held = holdings[msg.sender];
+        if (amount > held) amount = held;
+        if (amount == 0) revert NothingToWithdraw();
+        holdings[msg.sender] = held - amount;
+        totalHoldings -= amount;
+        _sendToken(msg.sender, amount);
+        emit Withdrawn(msg.sender, amount);
+    }
+
+    function _sendToken(address to, uint256 amount) internal {
+        (bool ok, bytes memory ret) = token.call(abi.encodeCall(IArenaToken.transfer, (to, amount)));
+        if (!ok || (ret.length != 0 && !abi.decode(ret, (bool)))) revert TransferFailed();
     }
 
     /// Buys the token with `amount` ETH through the router for `recipient`. Returns what `recipient`
@@ -611,11 +656,11 @@ contract SherwoodArena {
         return referrerOf[player] != address(0) && firstRoundPlus1[player] == round + 1;
     }
 
-    /// True when `player` played last round and still holds everything they bought through the arena then.
+    /// True when `player` played last round and their holdings still cover everything they bought then.
     function holderBonusActive(uint256 round, address player) public view returns (bool) {
         if (round == 0) return false;
         uint256 held = bought[round - 1][player];
-        return held > 0 && IBalanceOf(token).balanceOf(player) >= held;
+        return held > 0 && holdings[player] >= held;
     }
 
     /// Always false: the $PFWA game has no host token (kept for readers of v2's ABI).
@@ -685,7 +730,8 @@ contract SherwoodArena {
         emit FlipResolved(sequence, f.player, won, paidTo, amount);
     }
 
-    /// A flip Dice never revealed scores as a plain buy after FLIP_TIMEOUT. Anyone can call this.
+    /// A flip nobody revealed within FLIP_TIMEOUT (a day: HoodRand's refund window) scores as a plain buy.
+    /// Anyone can call this.
     function expireFlip(uint64 sequence) external {
         PendingFlip memory f = flips[sequence];
         if (f.player == address(0) || block.timestamp < f.requestedAt + FLIP_TIMEOUT) revert FlipNotExpired();
@@ -816,8 +862,8 @@ contract SherwoodArena {
 
     // ── Settlement and prizes ───────────────────────────────────────────────────
 
-    /// Ranks a finished round, picks its King of the Hill and splits its pot (v2.1). A winner holding
-    /// less than they bought through the arena that round keeps that share of the prize.
+    /// Ranks a finished round, picks its King of the Hill and splits its pot (v2.1). A winner whose
+    /// holdings are below what they bought through the arena that round keeps that share of the prize.
     function settle(uint256 round, uint256 maxPlayers) external returns (bool done) {
         if (block.timestamp < roundEnd(round) + SETTLE_DELAY) revert RoundNotOver();
         _pullTax();
@@ -874,14 +920,14 @@ contract SherwoodArena {
             (total * THIRD_BPS) / 10_000,
             (total * KING_BPS) / 10_000
         ];
-        uint256 buyback = (total * BURN_BPS) / 10_000;
+        uint256 buyback = (total * BUYBACK_BPS) / 10_000;
         uint256 awarded;
         for (uint256 i; i < 4; ++i) {
             address winner = _winner(r, i);
             if (winner == address(0)) continue;
             uint256 prize = shares[i];
             uint256 owed = bought[round][winner];
-            uint256 balance = IBalanceOf(token).balanceOf(winner);
+            uint256 balance = holdings[winner];
             if (balance < owed) {
                 uint256 kept = (prize * balance) / owed;
                 emit PrizeForfeited(round, winner, prize - kept);
@@ -913,13 +959,14 @@ contract SherwoodArena {
         return i < 3 ? r.top[i] : r.king;
     }
 
-    /// Pays `msg.sender` everything they won in `round` (rank and King of the Hill together).
+    /// Pays `msg.sender` everything they won in `round` (rank and King of the Hill together), if their
+    /// holdings still cover what they had at settlement (heldToClaim).
     function claim(uint256 round) external nonReentrant {
         Result storage r = _results[round];
         if (!r.settled) revert NotSettled();
         if (block.timestamp > claimDeadline(round)) revert ClaimWindowClosed();
         uint256 amount;
-        uint256 balance = IBalanceOf(token).balanceOf(msg.sender);
+        uint256 balance = holdings[msg.sender];
         for (uint256 i; i < 4; ++i) {
             if (_winner(r, i) == msg.sender && !r.claimed[i] && r.prize[i] > 0) {
                 if (balance < r.held[i]) revert MustHoldToClaim();
@@ -966,15 +1013,34 @@ contract SherwoodArena {
 
     // ── Buyback and burn ────────────────────────────────────────────────────────
 
-    /// Buys the token with `amount` of the buyback reserve through the router and sends it to 0x…dEaD.
-    /// ETH the router doesn't spend goes back to the reserve.
+    /// Buys the token with `amount` of the buyback reserve through the router, sends BURN_BPS/BUYBACK_BPS
+    /// of it to 0x…dEaD and keeps the rest here as spare tokens. ETH the router doesn't spend goes back
+    /// to the reserve.
     function buybackAndBurn(uint256 amount, uint256 minTokenOut) external onlyOperator nonReentrant {
         if (amount > buybackReserve) amount = buybackReserve;
         if (amount == 0) revert NothingToBurn();
         buybackReserve -= amount;
-        (uint256 burned, uint256 refund) = _buy(amount, minTokenOut, DEAD);
+        (uint256 bought_, uint256 refund) = _buy(amount, minTokenOut, address(this));
         if (refund > 0) buybackReserve += refund;
+        uint256 burned = (bought_ * BURN_BPS) / BUYBACK_BPS;
+        if (burned > 0) _sendToken(DEAD, burned);
         emit BuybackBurned(amount - refund, burned);
+        emit BuybackKept(bought_ - burned);
+    }
+
+    /// @notice Tokens here that are nobody's holdings: the kept part of every buyback, and anything sent
+    /// straight to the arena.
+    function spareTokens() public view returns (uint256) {
+        return IBalanceOf(token).balanceOf(address(this)) - totalHoldings;
+    }
+
+    /// Sends up to `amount` of the spare tokens to `to`. Never touches players' holdings.
+    function sendSpareTokens(address to, uint256 amount) external onlyOwner nonReentrant {
+        uint256 spare = spareTokens();
+        if (amount > spare) amount = spare;
+        if (amount == 0 || to == address(0)) revert NothingToWithdraw();
+        _sendToken(to, amount);
+        emit SpareTokensSent(to, amount);
     }
 
     /// Reclaims the fee of a Dice request that was never revealed into the buyback reserve.
@@ -987,7 +1053,8 @@ contract SherwoodArena {
         return 0;
     }
 
-    // ── Admin: ownership, the operator, and the Flip switch. Nothing else. ───────
+    // ── Admin: ownership, the operator, the Flip switch, the round length, the tax queue and the
+    // spare tokens (sendSpareTokens, above). Nothing touches pots, points, prizes or holdings. ───────
 
     function setOwner(address next) external onlyOwner {
         pendingOwner = next;

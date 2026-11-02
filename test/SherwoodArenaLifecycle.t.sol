@@ -51,7 +51,7 @@ contract SherwoodArenaLifecycleTest is SherwoodArenaFixture {
         assertEq(address(dice).balance, 0);
         assertEq(game.pot(0), amount / 20);
         assertEq(address(game).balance, amount / 20);
-        assertGt(gameToken.balanceOf(alice), 0);
+        assertGt(game.holdings(alice), 0);
     }
 
     /// Revision 2 added a second bound: the Dice fee may not exceed the 5% the flip's own buy pays in.
@@ -139,13 +139,20 @@ contract SherwoodArenaLifecycleTest is SherwoodArenaFixture {
         assertEq(game.pendingFlips(0), 0);
     }
 
-    function test_timeoutRecoveryUnblocksBatchedSettlementAtExactOpening() public {
+    function test_timeoutRecoveryUnblocksBatchedSettlementOnceTheFlipsAreADayOld() public {
         vm.warp(game.roundEnd(0) - 1);
+        uint256 requestedAt = vm.getBlockTimestamp();
         _buy(alice, 0.02 ether, SherwoodArena.Move.FLIP);
         _buy(bob, 0.03 ether, SherwoodArena.Move.FLIP);
         vm.warp(game.roundEnd(0) + game.SETTLE_DELAY());
         vm.expectRevert(SherwoodArena.FlipsPending.selector);
         game.settle(0, 1);
+        vm.expectRevert(SherwoodArena.FlipNotExpired.selector); // settlement is open, the timeout isn't up
+        game.expireFlip(1);
+        vm.warp(requestedAt + FLIP_TIMEOUT - 1);
+        vm.expectRevert(SherwoodArena.FlipsPending.selector);
+        game.settle(0, 1);
+        vm.warp(requestedAt + FLIP_TIMEOUT); // the exact second both flips can expire
         game.expireFlip(1);
         vm.expectRevert(SherwoodArena.FlipsPending.selector);
         game.settle(0, 1);

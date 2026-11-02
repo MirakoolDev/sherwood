@@ -27,7 +27,7 @@ contract SherwoodArenaFreshBoardInvariantTest is SherwoodArenaFixture {
         handler.buy(2, 0.01 ether, 1, 0); // a steal by the host holder
         handler.buy(3, 0.001 ether, 2, 5); // a minimum Robin Hood
 
-        bytes4[] memory selectors = new bytes4[](13);
+        bytes4[] memory selectors = new bytes4[](15);
         selectors[0] = handler.buy.selector;
         selectors[1] = handler.sell.selector;
         selectors[2] = handler.fund.selector;
@@ -41,6 +41,8 @@ contract SherwoodArenaFreshBoardInvariantTest is SherwoodArenaFixture {
         selectors[10] = handler.burn.selector;
         selectors[11] = handler.refund.selector;
         selectors[12] = handler.pushTax.selector;
+        selectors[13] = handler.withdraw.selector;
+        selectors[14] = handler.sendSpare.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector(address(handler), selectors));
     }
@@ -95,6 +97,16 @@ contract SherwoodArenaFreshBoardInvariantTest is SherwoodArenaFixture {
         }
     }
 
+    /// The arena's token balance backs every player's holdings, and the running total is their sum.
+    function invariant_tokensBackEveryHolding() public view {
+        assertEq(game.totalHoldings(), handler.sumHoldings(), "totalHoldings is the sum of all holdings");
+        assertGe(gameToken.balanceOf(address(game)), game.totalHoldings(), "every holding is backed by tokens");
+        // Nothing in this campaign sends tokens to the arena except its own buys: it holds the holdings
+        // plus what the buybacks kept, exactly.
+        assertEq(gameToken.balanceOf(address(game)), game.totalHoldings() + handler.keptTokens());
+        assertEq(game.spareTokens(), handler.keptTokens());
+    }
+
     function test_freshBoardStartsWithAReflectedHitAFlipAndAFullLiability() public view {
         // The seeded Robin Hood aimed at the shielded leader: reflected, the shield used one of its two
         // blocks (v2.1), the robber paid.
@@ -107,5 +119,6 @@ contract SherwoodArenaFreshBoardInvariantTest is SherwoodArenaFixture {
         invariant_ethHeldEqualsEveryObligation();
         invariant_reignHolderIsTheCachedLeaderWithTheMostPoints();
         invariant_settledRoundsKeepSevenDaysToClaimAndNeverHoldPendingFlips();
+        invariant_tokensBackEveryHolding();
     }
 }

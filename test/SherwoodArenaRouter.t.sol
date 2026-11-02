@@ -14,11 +14,15 @@ contract ArenaAgent {
         a.claim(round);
     }
 
+    function withdraw(SherwoodArena a, uint256 amount) external {
+        a.withdraw(amount);
+    }
+
     receive() external payable {}
 }
 
 /// What only the arena does: the router path, the buy tax, slippage, players that are contracts, sells
-/// settled at settlement, the Flip switch, re-entry through the router, and the play fee settings.
+/// (withdrawals) settled at settlement, the Flip switch, re-entry through the router, and the play fee settings.
 contract SherwoodArenaRouterTest is SherwoodArenaFixture {
     event PotFunded(uint256 indexed round, uint256 amount, bool fromSell);
     event PrizeForfeited(uint256 indexed round, address indexed player, uint256 amount);
@@ -49,7 +53,8 @@ contract SherwoodArenaRouterTest is SherwoodArenaFixture {
         emit PotFunded(0, 0.00285 ether, false); // the tax: 3% of the 0.095 swapped
         _buy(alice, 0.1 ether, SherwoodArena.Move.BUY);
         assertEq(game.pot(0), 0.005 ether + 0.00285 ether);
-        assertEq(gameToken.balanceOf(alice), 0.095 ether - 0.00285 ether);
+        assertEq(game.holdings(alice), 0.095 ether - 0.00285 ether);
+        assertEq(gameToken.balanceOf(address(game)), 0.095 ether - 0.00285 ether);
         assertEq(game.bought(0, alice), 0.095 ether - 0.00285 ether);
         assertEq(game.points(0, alice), 100, "points are on the ETH sent");
         _assertBooks();
@@ -100,11 +105,13 @@ contract SherwoodArenaRouterTest is SherwoodArenaFixture {
         assertEq(game.referrerOf(alice), address(0));
         assertEq(game.shieldBlocks(alice), 0);
         assertEq(game.playerCount(0), 0);
-        assertEq(gameToken.balanceOf(alice), 0);
+        assertEq(game.holdings(alice), 0);
+        assertEq(game.totalHoldings(), 0);
+        assertEq(gameToken.balanceOf(address(game)), 0);
         // The same router within the limit is fine.
         vm.prank(alice);
         game.play{value: 0.05 ether}(uint8(SherwoodArena.Move.BUY), 0.02 ether, address(0));
-        assertEq(gameToken.balanceOf(alice), 0.02375 ether);
+        assertEq(game.holdings(alice), 0.02375 ether);
         assertEq(game.points(0, alice), 50);
     }
 
@@ -128,12 +135,15 @@ contract SherwoodArenaRouterTest is SherwoodArenaFixture {
         agent.play{value: 0.05 ether}(game, 0);
         assertEq(game.points(0, address(agent)), 50);
         assertEq(game.points(0, alice), 0);
-        assertEq(gameToken.balanceOf(address(agent)), 0.0475 ether);
+        assertEq(game.holdings(address(agent)), 0.0475 ether);
         assertEq(game.bought(0, address(agent)), 0.0475 ether);
         _finishRound(0);
         uint256 owed = _unpaid(0);
         agent.claim(game, 0);
         assertEq(address(agent).balance, owed);
+        agent.withdraw(game, type(uint256).max); // and takes its tokens out after
+        assertEq(gameToken.balanceOf(address(agent)), 0.0475 ether);
+        assertEq(game.holdings(address(agent)), 0);
         _assertBooks();
     }
 
@@ -144,7 +154,7 @@ contract SherwoodArenaRouterTest is SherwoodArenaFixture {
         _buy(bob, 0.05 ether, SherwoodArena.Move.BUY);
         uint256 total = game.pot(0);
         uint256 bought_ = game.bought(0, alice);
-        _sell(alice, bought_ / 5); // sold 20% anywhere: points stay
+        _sell(alice, bought_ / 5); // withdrew and sold 20%: points stay
         assertEq(game.points(0, alice), 100);
         vm.warp(game.roundEnd(0) + game.SETTLE_DELAY());
         uint256 first = (total * 4000) / 10_000;
@@ -218,6 +228,7 @@ contract SherwoodArenaRouterTest is SherwoodArenaFixture {
         assertEq(_attempt(abi.encodeCall(SherwoodArena.claim, (0))), SherwoodArena.Reentered.selector);
         assertEq(_attempt(abi.encodeCall(SherwoodArena.claimReferral, ())), SherwoodArena.Reentered.selector);
         assertEq(_attempt(abi.encodeCall(SherwoodArena.sweepUnclaimed, (0))), SherwoodArena.Reentered.selector);
+        assertEq(_attempt(abi.encodeCall(SherwoodArena.withdraw, (1))), SherwoodArena.Reentered.selector);
         _assertBooks();
     }
 
@@ -249,7 +260,8 @@ contract SherwoodArenaRouterTest is SherwoodArenaFixture {
         uint256 tax = (reserve * 500) / 10_000;
         assertEq(game.buybackReserve(), 0);
         assertEq(game.pot(live), potBefore + tax, "the tax on the burn lands in the live pot");
-        assertEq(gameToken.balanceOf(DEAD), reserve - tax);
+        assertEq(gameToken.balanceOf(DEAD), ((reserve - tax) * 1000) / 1700);
+        assertEq(game.spareTokens(), (reserve - tax) - ((reserve - tax) * 1000) / 1700);
         _assertBooks();
     }
 
@@ -280,7 +292,7 @@ contract SherwoodArenaRouterTest is SherwoodArenaFixture {
         vm.prank(alice);
         free.play{value: 0.1 ether}(0, 0, address(0));
         assertEq(free.pot(0), 0.002 ether, "only the tax");
-        assertEq(gameToken.balanceOf(alice), 0.098 ether);
+        assertEq(free.holdings(alice), 0.098 ether);
         assertEq(free.points(0, alice), 100);
         // A flip still costs the pot at most 5% of its move: the tax pot covers Dice's fee.
         vm.deal(bob, 0.02 ether);
@@ -301,7 +313,8 @@ contract SherwoodArenaRouterTest is SherwoodArenaFixture {
     function test_noHostToken() public view {
         assertFalse(game.hostBonusActive(alice));
         assertEq(game.hostBuybackReserve(), 0);
-        assertEq(game.BURN_BPS(), 1700);
+        assertEq(game.BUYBACK_BPS(), 1700);
+        assertEq(game.BURN_BPS(), 1000);
         assertEq(address(game.router()), address(router));
         assertEq(game.token(), address(gameToken));
         assertEq(game.playFeeBps(), 500);

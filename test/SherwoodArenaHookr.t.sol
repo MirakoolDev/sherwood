@@ -170,9 +170,11 @@ contract SherwoodArenaHookrTest is Test {
         assertEq(amountSpecified, -int128(0.01 ether), "exact input");
         assertEq(amountBound, 1, "Hookr refuses a zero bound");
         assertEq(sqrtPriceLimitX96, TickMath.MIN_SQRT_PRICE + 1);
-        assertEq(recipient, alice, "the token goes straight to the player");
+        assertEq(recipient, address(game), "the token goes to the arena, which keeps it for the player");
         assertEq(deadline, block.timestamp);
-        assertEq(pfwa.balanceOf(alice), 0.01 ether * 20_000_000);
+        assertEq(pfwa.balanceOf(address(game)), 0.01 ether * 20_000_000);
+        assertEq(pfwa.balanceOf(alice), 0);
+        assertEq(game.holdings(alice), 0.01 ether * 20_000_000, "credited to her holdings");
         assertEq(game.points(0, alice), 10);
         assertEq(game.bought(0, alice), 0.01 ether * 20_000_000);
     }

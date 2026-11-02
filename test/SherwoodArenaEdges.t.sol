@@ -212,7 +212,7 @@ contract SherwoodArenaEdgesTest is SherwoodArenaFixture {
 
     // ── Flip lifecycle at the round boundary ────────────────────────────────────
 
-    function test_flipInTheLastSecondOfARoundExpiresBeforeSettlementOpens() public {
+    function test_flipInTheLastSecondOfARoundHoldsItsSettlementForADay() public {
         vm.warp(game.roundEnd(0) - 1);
         _buy(alice, 0.01 ether, SherwoodArena.Move.FLIP);
         uint64 seq = dice.nextSequence() - 1;
@@ -222,14 +222,30 @@ contract SherwoodArenaEdgesTest is SherwoodArenaFixture {
         assertEq(game.pendingFlips(0), 1);
         assertEq(game.points(0, alice), 0);
 
+        // Settlement opens on time but waits: the flip can't be expired until a day after the request.
+        vm.warp(game.roundEnd(0) + game.SETTLE_DELAY());
+        vm.expectRevert(SherwoodArena.FlipsPending.selector);
+        game.settle(0, 100);
+        vm.expectRevert(SherwoodArena.FlipNotExpired.selector);
+        game.expireFlip(seq);
+
+        // A day is more than a 20-hour round: the next round ends and settles while round 0 waits.
+        _buy(bob, 0.01 ether, SherwoodArena.Move.BUY);
+        vm.warp(game.roundEnd(1) + game.SETTLE_DELAY());
+        assertLt(block.timestamp, requestedAt + FLIP_TIMEOUT);
+        assertTrue(game.settle(1, 100), "a later round doesn't wait for round 0's flip");
+
         vm.warp(requestedAt + FLIP_TIMEOUT - 1);
         vm.expectRevert(SherwoodArena.FlipNotExpired.selector);
         game.expireFlip(seq);
+        vm.expectRevert(SherwoodArena.FlipsPending.selector);
+        game.settle(0, 100);
         vm.warp(requestedAt + FLIP_TIMEOUT);
-        assertLt(block.timestamp, game.roundEnd(0) + game.SETTLE_DELAY(), "expiry opens before settlement does");
+        assertEq(game.currentRound(), 2, "the expiry lands two rounds later");
         game.expireFlip(seq);
         assertEq(game.pendingFlips(0), 0);
         assertEq(game.points(0, alice), 10, "an unrevealed flip scores as a plain buy in its own round");
+        assertEq(game.points(2, alice), 0);
         assertEq(game.reignOf(0, alice), 0, "a reign started after the round ended counts nothing");
 
         vm.expectRevert(SherwoodArena.FlipNotExpired.selector);
@@ -237,21 +253,41 @@ contract SherwoodArenaEdgesTest is SherwoodArenaFixture {
         vm.expectRevert(SherwoodArena.FlipNotExpired.selector);
         game.expireFlip(seq + 1000);
 
-        vm.warp(game.roundEnd(0) + game.SETTLE_DELAY());
+        uint256 total = game.pot(0);
+        uint256 liveBefore = game.pot(2);
         assertTrue(game.settle(0, 100));
-        (, address[3] memory top,,,, address king,, uint256 kingPrize,) = game.result(0);
+        (, address[3] memory top,, uint256[3] memory prize,, address king,, uint256 kingPrize,) = game.result(0);
         assertEq(top[0], alice);
         assertEq(king, address(0), "nobody held #1 inside the round");
         assertEq(kingPrize, 0);
+        assertEq(
+            game.pot(2) - liveBefore,
+            total - prize[0] - (total * 1700) / 10_000,
+            "the rollover goes to the round live at settlement"
+        );
     }
 
-    function test_settlementIsBlockedOnlyUntilTheLastSecondFlipIsExpired() public {
+    function test_settlementIsBlockedUntilTheLastSecondFlipIsRevealedOrADayOld() public {
         vm.warp(game.roundEnd(0) - 1);
         _buy(alice, 0.01 ether, SherwoodArena.Move.FLIP);
         uint64 seq = dice.nextSequence() - 1;
+        (,,, uint64 requestedAt,,) = game.flips(seq);
         vm.warp(game.roundEnd(0) + game.SETTLE_DELAY());
         vm.expectRevert(SherwoodArena.FlipsPending.selector);
         game.settle(0, 100);
+        vm.expectRevert(SherwoodArena.FlipNotExpired.selector);
+        game.expireFlip(seq);
+        uint256 snapshot = vm.snapshotState();
+
+        // Revealed (a win): settlement opens at once.
+        assertTrue(dice.reveal(seq, bytes32(uint256(2))));
+        assertEq(game.pendingFlips(0), 0);
+        assertTrue(game.settle(0, 100));
+        assertGt(game.points(0, alice), 10, "a won flip pays more than a buy");
+
+        // Never revealed: expired a day after the request, then settled.
+        assertTrue(vm.revertToState(snapshot));
+        vm.warp(requestedAt + FLIP_TIMEOUT);
         game.expireFlip(seq);
         assertTrue(game.settle(0, 100));
         // A late reveal of the expired flip changes nothing.
@@ -345,7 +381,7 @@ contract SherwoodArenaEdgesTest is SherwoodArenaFixture {
         for (uint256 i; i < 4; ++i) {
             uint256 share = (total * shareBps[i]) / 10_000;
             uint256 owed = game.bought(0, winners[i]);
-            uint256 held = gameToken.balanceOf(winners[i]);
+            uint256 held = game.holdings(winners[i]);
             uint256 expected = held < owed ? (share * held) / owed : share;
             assertEq(prizes[i], expected, "a prize shrinks with the share of the buys sold");
             assertLe(prizes[i], share);
@@ -506,9 +542,13 @@ contract SherwoodArenaEdgesTest is SherwoodArenaFixture {
 
     // ── Helpers ─────────────────────────────────────────────────────────────────
 
+    /// Withdraws all but `keepBps` of `who`'s holdings and moves the tokens out of their wallet.
     function _moveAway(address who, uint256 keepBps) internal {
-        uint256 balance = gameToken.balanceOf(who);
+        uint256 balance = game.holdings(who);
         uint256 away = balance - (balance * keepBps) / 10_000;
+        if (away == 0) return;
+        vm.prank(who);
+        game.withdraw(away);
         vm.prank(who);
         gameToken.transfer(sink, away);
     }

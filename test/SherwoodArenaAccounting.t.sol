@@ -18,24 +18,29 @@ contract SherwoodArenaAccountingTest is SherwoodArenaFixture {
         assertEq(address(game).balance, fee);
         assertEq(game.pot(0), fee);
         assertEq(address(router).balance - routerBefore + fee, amount, "the rest went to the router");
-        assertEq(gameToken.balanceOf(alice), amount - fee, "1:1 at the mock router");
-        assertEq(game.bought(0, alice), amount >= MIN_BUY ? gameToken.balanceOf(alice) : 0);
+        assertEq(game.holdings(alice), amount - fee, "1:1 at the mock router, into her holdings");
+        assertEq(game.totalHoldings(), amount - fee);
+        assertEq(gameToken.balanceOf(address(game)), amount - fee, "the arena keeps the tokens");
+        assertEq(gameToken.balanceOf(alice), 0);
+        assertEq(game.bought(0, alice), amount >= MIN_BUY ? game.holdings(alice) : 0);
     }
 
-    /// The arena can't see a sell: it moves no ETH and no points, only the player's balance, which
+    /// A sell starts with a withdraw: it moves no ETH and no points, only the player's holdings, which
     /// settlement reads.
     /// forge-config: default.fuzz.runs = 1000
     function testFuzz_sellMovesNoArenaEthAndKeepsTheHoldingObligation(uint256 amount, uint256 portion) public {
         amount = bound(amount, 0.001 ether, 0.5 ether);
         _buy(alice, amount, SherwoodArena.Move.BUY);
-        uint256 tokens = gameToken.balanceOf(alice);
+        uint256 tokens = game.holdings(alice);
         uint256 sold = bound(portion, 1, tokens);
         uint256 potBefore = game.pot(0);
         int256 pointsBefore = game.points(0, alice);
         _sell(alice, sold);
         assertEq(game.pot(0), potBefore);
         assertEq(game.points(0, alice), pointsBefore);
-        assertEq(gameToken.balanceOf(alice), tokens - sold);
+        assertEq(game.holdings(alice), tokens - sold);
+        assertEq(game.totalHoldings(), tokens - sold);
+        assertEq(gameToken.balanceOf(address(game)), tokens - sold);
         assertEq(game.bought(0, alice), tokens, "selling does not erase the holding obligation");
         assertEq(address(game).balance, game.pot(0));
     }
@@ -74,6 +79,9 @@ contract SherwoodArenaAccountingTest is SherwoodArenaFixture {
         assertEq(game.shieldCharges(0, alice), 0);
         assertEq(game.reignHolder(0), address(0));
         assertEq(gameToken.balanceOf(alice), 0);
+        assertEq(game.holdings(alice), 0);
+        assertEq(game.totalHoldings(), 0);
+        assertEq(gameToken.balanceOf(address(game)), 0);
     }
 
     /// A burn the router only partly fills keeps the rest in the reserve.
@@ -88,11 +96,12 @@ contract SherwoodArenaAccountingTest is SherwoodArenaFixture {
         game.buybackAndBurn(type(uint256).max, 1);
         uint256 spent = beforeETH - address(game).balance;
         assertEq(spent, requested - (requested * 4000) / 10_000);
-        assertEq(gameToken.balanceOf(DEAD), spent);
+        assertEq(gameToken.balanceOf(DEAD), (spent * 1000) / 1700);
         assertEq(game.buybackReserve(), requested - spent);
         assertEq(address(router).balance, spent);
         assertEq(game.pot(game.currentRound()), nextPot);
-        assertEq(gameToken.balanceOf(address(game)), 0);
+        assertEq(gameToken.balanceOf(address(game)), spent - (spent * 1000) / 1700, "only the kept part stays");
+        assertEq(game.spareTokens(), gameToken.balanceOf(address(game)));
     }
 
     /// forge-config: default.fuzz.runs = 1000
@@ -115,7 +124,8 @@ contract SherwoodArenaAccountingTest is SherwoodArenaFixture {
         router.setUnderpay(false);
         vm.prank(owner);
         game.buybackAndBurn(reserve, 1);
-        assertEq(gameToken.balanceOf(DEAD), reserve);
+        assertEq(gameToken.balanceOf(DEAD), (reserve * 1000) / 1700);
+        assertEq(game.spareTokens(), reserve - (reserve * 1000) / 1700);
     }
 
     /// A router that can't fill at all (sends everything back): the reserve stays, claims still pay.
@@ -146,10 +156,9 @@ contract SherwoodArenaAccountingTest is SherwoodArenaFixture {
         vm.warp(GENESIS + 10 hours);
         _play(bob, 0.09 ether, 0, referrer);
         _play(carol, 0.08 ether, 0, referrer);
-        uint256 holding = gameToken.balanceOf(alice);
+        uint256 holding = game.holdings(alice);
         kept = bound(kept, 0, holding);
-        vm.prank(alice);
-        gameToken.transfer(makeAddr("outside holder"), holding - kept);
+        if (holding > kept) _sell(alice, holding - kept);
         _seed(0, bound(seed, 0, 100 ether));
         vm.warp(game.roundEnd(0) + game.SETTLE_DELAY());
         uint256 snapshot = vm.snapshotState();

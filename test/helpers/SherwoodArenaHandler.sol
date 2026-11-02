@@ -8,6 +8,8 @@ import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 
 /// SherwoodV21Handler's campaign on the arena. Every move goes through play() and the mock router, which
 /// pushes a 1% buy tax to the arena (from a separate contract, as Hookr's tax would) during the swap.
+/// The arena keeps what a play buys (holdings); withdraw moves it to the wallet, where sell and
+/// transferHolding move it about without the arena seeing.
 /// Unexpected reverts fail the campaign; expected failures are checked by selector.
 contract SherwoodArenaHandler is Test {
     SherwoodArena public immutable game;
@@ -20,7 +22,8 @@ contract SherwoodArenaHandler is Test {
     uint256 public constant MAX_ROUND = 32;
     uint256 public constant TAX_BPS = 100;
     uint256 internal constant MIN_BUY = 0.001 ether;
-    uint256 internal constant FLIP_TIMEOUT = 10 minutes;
+    uint256 internal constant FLIP_TIMEOUT = 1 days;
+    address internal constant DEAD_ADDR = 0x000000000000000000000000000000000000dEaD;
 
     // Independent ETH-flow ledger. No deal() ever touches the arena, the router or Dice.
     uint256 public deposits;
@@ -30,12 +33,15 @@ contract SherwoodArenaHandler is Test {
     uint256 public burnETH;
     uint256 public buys;
     uint256 public sells;
+    uint256 public withdrawals;
     uint256 public taxPushes;
     uint256 public settledRounds;
     uint256 public prizeClaims;
     uint256 public referralClaims;
     uint256 public sweptRounds;
     uint256 public burns;
+    /// The $PFWA the buybacks kept in the arena (7/17 of what each bought), less what the owner sent on.
+    uint256 public keptTokens;
     uint256 public revealed;
     uint256 public expired;
     uint256 public refunds;
@@ -58,7 +64,9 @@ contract SherwoodArenaHandler is Test {
     function buy(uint256 actorSeed, uint256 rawAmount, uint256 moveSeed, uint256 refSeed) public {
         address player = actors[actorSeed % actors.length];
         uint256 amount = bound(rawAmount, 1, 0.2 ether);
-        uint256 beforeTokens = token.balanceOf(player);
+        uint256 beforeTokens = game.holdings(player);
+        uint256 arenaTokensBefore = token.balanceOf(address(game));
+        uint256 walletBefore = token.balanceOf(player);
         uint256 routerBefore = router.ethReceived();
         uint256 paidDiceBefore = dice.received();
         uint256 gameBefore = address(game).balance;
@@ -73,24 +81,52 @@ contract SherwoodArenaHandler is Test {
         ++buys;
         assertEq(router.ethReceived() - routerBefore + fee + tax, amount, "every wei of the move is accounted");
         assertEq(address(game).balance + dice.received() - paidDiceBefore, gameBefore + fee + tax);
-        uint256 receivedTokens = token.balanceOf(player) - beforeTokens;
+        uint256 receivedTokens = game.holdings(player) - beforeTokens;
         assertEq(receivedTokens, amount - fee - tax, "1:1 at the mock router, after the fee and the tax");
+        assertEq(token.balanceOf(address(game)) - arenaTokensBefore, receivedTokens, "the arena keeps the buy");
+        assertEq(token.balanceOf(player), walletBefore, "nothing reaches the wallet on a play");
         assertEq(game.bought(round, player) - boughtBefore, amount >= MIN_BUY ? receivedTokens : 0);
     }
 
-    /// A sell anywhere else: the arena sees nothing; only the balance drops (tokens leave to an outsider).
+    /// A sell anywhere else: tokens in the wallet (withdrawn earlier) leave to an outsider. The arena
+    /// sees nothing.
     function sell(uint256 actorSeed, uint256 amountSeed) public {
         address player = actors[actorSeed % actors.length];
         uint256 tokens = token.balanceOf(player);
         if (tokens == 0) return;
         uint256 amount = bound(amountSeed, 1, tokens);
         uint256 gameBefore = address(game).balance;
+        uint256 heldBefore = game.holdings(player);
         int256 score = game.points(game.currentRound(), player);
         vm.prank(player);
         token.transfer(address(0xbeef), amount);
         ++sells;
         assertEq(address(game).balance, gameBefore);
+        assertEq(game.holdings(player), heldBefore, "a wallet sell doesn't touch holdings");
         assertEq(game.points(game.currentRound(), player), score, "a sell doesn't touch points");
+    }
+
+    /// Takes part (or all, or more than all: capped) of a player's holdings out to their wallet.
+    function withdraw(uint256 actorSeed, uint256 amountSeed) public {
+        address player = actors[actorSeed % actors.length];
+        uint256 held = game.holdings(player);
+        uint256 amount = bound(amountSeed, 0, held + 1 ether);
+        uint256 expected = amount < held ? amount : held;
+        uint256 walletBefore = token.balanceOf(player);
+        uint256 arenaBefore = token.balanceOf(address(game));
+        uint256 totalBefore = game.totalHoldings();
+        uint256 gameBefore = address(game).balance;
+        int256 score = game.points(game.currentRound(), player);
+        vm.prank(player);
+        if (expected == 0) vm.expectRevert(SherwoodArena.NothingToWithdraw.selector);
+        game.withdraw(amount);
+        if (expected > 0) ++withdrawals;
+        assertEq(game.holdings(player), held - expected);
+        assertEq(game.totalHoldings(), totalBefore - expected);
+        assertEq(token.balanceOf(player) - walletBefore, expected);
+        assertEq(arenaBefore - token.balanceOf(address(game)), expected);
+        assertEq(address(game).balance, gameBefore, "a withdraw moves no ETH");
+        assertEq(game.points(game.currentRound(), player), score, "a withdraw doesn't touch points");
     }
 
     /// The pool's buy tax arriving on its own (not during one of the arena's swaps).
@@ -122,8 +158,12 @@ contract SherwoodArenaHandler is Test {
         address from = actors[fromSeed % actors.length];
         address to = actors[toSeed % actors.length];
         uint256 amount = bound(amountSeed, 0, token.balanceOf(from));
+        uint256 heldFrom = game.holdings(from);
+        uint256 heldTo = game.holdings(to);
         vm.prank(from);
         token.transfer(to, amount);
+        assertEq(game.holdings(from), heldFrom, "wallet transfers never move holdings");
+        assertEq(game.holdings(to), heldTo);
     }
 
     function advance(uint256 elapsed) public {
@@ -169,13 +209,19 @@ contract SherwoodArenaHandler is Test {
         if (game.pendingFlips(round) != 0) {
             vm.expectRevert(SherwoodArena.FlipsPending.selector);
             game.settle(round, 6);
+            // Expire what a day has passed on; a flip younger than that keeps the round waiting.
             for (uint64 seq = 1; seq < dice.nextSequence(); ++seq) {
-                (address player,, uint64 r,,,) = game.flips(seq);
-                if (player != address(0) && r == round) {
+                (address player,, uint64 r, uint64 requestedAt,,) = game.flips(seq);
+                if (player == address(0) || r != round) continue;
+                if (block.timestamp < requestedAt + FLIP_TIMEOUT) {
+                    vm.expectRevert(SherwoodArena.FlipNotExpired.selector);
                     game.expireFlip(seq);
-                    ++expired;
+                    continue;
                 }
+                game.expireFlip(seq);
+                ++expired;
             }
+            if (game.pendingFlips(round) != 0) return;
         }
         if (game.settle(round, bound(batchSeed, 1, 6))) {
             ++settledRounds;
@@ -216,7 +262,7 @@ contract SherwoodArenaHandler is Test {
             reason = SherwoodArena.NotSettled.selector;
         } else if (block.timestamp > game.claimDeadline(round)) {
             reason = SherwoodArena.ClaimWindowClosed.selector;
-        } else if (owed != 0 && token.balanceOf(player) < game.heldToClaim(round, player)) {
+        } else if (owed != 0 && game.holdings(player) < game.heldToClaim(round, player)) {
             reason = SherwoodArena.MustHoldToClaim.selector;
         } else if (owed == 0) {
             reason = SherwoodArena.NothingToClaim.selector;
@@ -263,9 +309,17 @@ contract SherwoodArenaHandler is Test {
         uint256 live = game.currentRound();
         uint256 potBefore = game.pot(live);
         uint256 minimum = rejectSlippage ? type(uint256).max : 0;
+        uint256 deadBefore = token.balanceOf(DEAD_ADDR);
+        uint256 arenaTokensBefore = token.balanceOf(address(game));
         vm.prank(owner);
         if (rejectSlippage) vm.expectRevert("router: too little out");
         game.buybackAndBurn(requested, minimum);
+        if (!rejectSlippage) {
+            uint256 burnedNow = token.balanceOf(DEAD_ADDR) - deadBefore;
+            uint256 keptNow = token.balanceOf(address(game)) - arenaTokensBefore;
+            assertEq(burnedNow, ((burnedNow + keptNow) * 1000) / 1700, "10/17 of each buyback burns");
+            keptTokens += keptNow;
+        }
         if (rejectSlippage) {
             assertEq(game.buybackReserve(), reserve);
             assertEq(address(game).balance, beforeETH);
@@ -283,6 +337,21 @@ contract SherwoodArenaHandler is Test {
         assertEq(game.pot(live), potBefore + tax);
     }
 
+    /// The owner sends some of the spare tokens on: never more than the spare, holdings untouched.
+    function sendSpare(uint256 amountSeed) public {
+        uint256 spare = game.spareTokens();
+        if (spare == 0) return;
+        uint256 amount = bound(amountSeed, 1, spare);
+        uint256 held = game.totalHoldings();
+        address to = makeAddr("treasury");
+        uint256 toBefore = token.balanceOf(to);
+        vm.prank(owner);
+        game.sendSpareTokens(to, amount);
+        assertEq(token.balanceOf(to) - toBefore, amount);
+        assertEq(game.totalHoldings(), held);
+        keptTokens -= amount;
+    }
+
     function refund(uint256 sequenceSeed) public {
         if (dice.nextSequence() == 1) return;
         uint64 seq = uint64(bound(sequenceSeed, 1, dice.nextSequence() - 1));
@@ -294,6 +363,13 @@ contract SherwoodArenaHandler is Test {
         game.refundDiceRequest(seq);
         assertEq(game.buybackReserve(), beforeReserve + paid);
         ++refunds;
+    }
+
+    /// The sum of every actor's holdings (only actors ever play, so this is all of them).
+    function sumHoldings() public view returns (uint256 sum) {
+        for (uint256 i; i < actors.length; ++i) {
+            sum += game.holdings(actors[i]);
+        }
     }
 
     function unpaidPrizes(uint256 round) public view returns (uint256 amount) {
