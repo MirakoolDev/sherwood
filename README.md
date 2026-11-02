@@ -257,6 +257,17 @@ Holdings assume nothing the player controls runs during the arena's own swap (a 
 
 `forge test --match-contract "SherwoodArena|SherwoodPotVault|PonsFeeSplitter"`: the v2.1 suites carried over to the arena, plus the router, tax, slippage, re-entry, contract-player, round-length and vault tests, the escrow tests (`test/SherwoodArenaEscrow.t.sol`: flash-borrow attacks at settlement, at claim and inside `play()`, withdrawals, spare tokens), invariants that the arena's tokens equal everyone's holdings plus the kept buybacks, and fork tests against Hookr's router and the Pons locker (the Pons fork test skips when no fees are owed at the latest block).
 
+## Pons fee splitter factory
+
+[`src/PonsFeeSplitterFactory.sol`](src/PonsFeeSplitterFactory.sol) lets any token launched on Pons get its own [`PonsFeeSplitter`](src/PonsFeeSplitter.sol), the contract that sends half of $PFWA's Pons creator fees into the Sherwood pot every day. Every copy is the same contract, so each one verifies against the same source.
+
+- **Who:** only the wallet that launched the token on Pons (the token's `deployer()`), once per token, so nobody else can take a project's slot. Only tokens made by Pons' launch factory and paired with WETH.
+- **Where:** a CREATE2 address that depends only on the token, owner and treasury; `predict(token, owner, treasury)` gives it before it exists.
+- **After create:** the launcher points the token's fees at the splitter on Pons (`setFeeRedirect` on the locker), and the owner sets the pot (`setPot`) and its share (`setPotShare`, half to start). Once a day anyone can run `distribute()`: the pot's share of the ETH to the pot, the rest of the ETH and all the token to the treasury.
+- **The factory** takes no fee and owns nothing it makes. Lookups: `splitterOf(token)`, `count()`, `page(start, n)`.
+
+Tests: `forge test --match-contract PonsFeeSplitterFactory` (plus a fork test that makes a splitter for $PFWA's real launch when `ROBINHOOD_RPC_URL` is set). Deploying to Robinhood Chain next; the address goes here once it's live.
+
 ## HoodRand: verifiable randomness for Robinhood Chain
 
 [`hoodrand/`](hoodrand/) is HoodRand, live at [`0xbE5105faf1Cb76733876959d5802448d066D734F`](https://robinhoodchain.blockscout.com/address/0xbE5105faf1Cb76733876959d5802448d066D734F). It turns drand's evmnet beacon (the League of Entropy, a new BLS signature every 3 seconds) into random numbers checked onchain with Robinhood Chain's BN254 pairing precompile, so nobody, PFWA included, can predict or bias a result. It has the same interface as Dice Protocol and Pyth Entropy, so contracts built for them work unchanged. Fee: 0.00002 ETH a request. See [`hoodrand/README.md`](hoodrand/README.md).
