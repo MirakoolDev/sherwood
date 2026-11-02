@@ -83,11 +83,23 @@ contract SherwoodArenaRoundsTest is SherwoodArenaFixture {
         assertEq(early.roundEnd(0), block.timestamp + 1 days + 1 hours);
     }
 
-    function test_deployLengthIsOneOfTheAllowed() public {
+    function test_deployLengthIsWholeMinutesFromFiveMinutesToSevenDays() public {
         vm.expectRevert(SherwoodArena.BadRoundLength.selector);
         new SherwoodArena(
-            address(gameToken), IArenaRouter(address(router)), IDiceEntropy(address(dice)), address(1), owner, GENESIS, 500, true, 2 hours
+            address(gameToken), IArenaRouter(address(router)), IDiceEntropy(address(dice)), address(1), owner, GENESIS, 500, true, 4 minutes
         );
+        vm.expectRevert(SherwoodArena.BadRoundLength.selector);
+        new SherwoodArena(
+            address(gameToken), IArenaRouter(address(router)), IDiceEntropy(address(dice)), address(1), owner, GENESIS, 500, true, 7 days + 1 minutes
+        );
+        vm.expectRevert(SherwoodArena.BadRoundLength.selector);
+        new SherwoodArena(
+            address(gameToken), IArenaRouter(address(router)), IDiceEntropy(address(dice)), address(1), owner, GENESIS, 500, true, 2 hours + 30
+        );
+        SherwoodArena twenty = new SherwoodArena(
+            address(gameToken), IArenaRouter(address(router)), IDiceEntropy(address(dice)), address(1), owner, GENESIS, 500, true, 20 hours
+        );
+        assertEq(twenty.roundEnd(0), GENESIS + 20 hours);
         SherwoodArena hourly = new SherwoodArena(
             address(gameToken), IArenaRouter(address(router)), IDiceEntropy(address(dice)), address(1), owner, GENESIS, 500, true, 1 hours
         );
@@ -100,10 +112,31 @@ contract SherwoodArenaRoundsTest is SherwoodArenaFixture {
         game.setRoundLength(1 hours);
         vm.prank(owner);
         vm.expectRevert(SherwoodArena.BadRoundLength.selector);
-        game.setRoundLength(10 minutes);
+        game.setRoundLength(4 minutes);
         vm.prank(owner);
         vm.expectRevert(SherwoodArena.BadRoundLength.selector);
         game.setRoundLength(0);
+        vm.prank(owner);
+        vm.expectRevert(SherwoodArena.BadRoundLength.selector);
+        game.setRoundLength(90 seconds + 1 hours);
+        vm.prank(owner);
+        vm.expectRevert(SherwoodArena.BadRoundLength.selector);
+        game.setRoundLength(8 days);
+    }
+
+    /// 4 h, 15 h, 10 min: any whole-minute length works, from the next boundary, without a new contract.
+    function test_anyWholeMinuteLengthCanBeSet() public {
+        uint256[4] memory lengths = [uint256(4 hours), 15 hours, 10 minutes, 7 days];
+        for (uint256 i; i < lengths.length; ++i) {
+            uint256 next = game.currentRound() + 1;
+            uint256 boundary = game.roundEnd(next - 1);
+            vm.prank(owner);
+            game.setRoundLength(lengths[i]);
+            vm.warp(boundary);
+            assertEq(game.currentRound(), next);
+            assertEq(game.roundEnd(next), boundary + lengths[i]);
+            assertEq(game.ROUND_LENGTH(), lengths[i]);
+        }
     }
 
     function test_theGameSettlesAcrossAChange() public {

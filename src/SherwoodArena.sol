@@ -53,7 +53,7 @@ interface IArenaTaxQueue {
 ///      10/17 of it (10% of the pot); the rest (7%) stays here as spare tokens the owner can send on.
 ///   5. The owner can switch Flip off (flipsEnabled) while Dice Protocol is unreliable: a FLIP then plays
 ///      as a BUY and spends no charge.
-/// Everything else is v2.1, except that the round length is an owner setting (5 min to 20 h, from the next
+/// Everything else is v2.1, except that the round length is an owner setting (any whole number of minutes from 5 min to 7 days, from the next
 /// round boundary; v2.1's 20 h by default): 1 point per 0.001 ETH (up to 100 a move);
 /// BUY, STEAL, ROBIN_HOOD, FLIP and SHIELD with their charges and shield blocks; the holder, welcome and
 /// referral bonuses; King of the Hill; settlement 40/20/10% to the top three, 8% to the King, 17% to the
@@ -451,9 +451,9 @@ contract SherwoodArena {
         return _periods[i];
     }
 
+    /// Any whole number of minutes from 5 minutes to 7 days (20 h, 4 h, 15 h, 1 h ...).
     function _allowedLength(uint256 length) internal pure returns (bool) {
-        return length == 5 minutes || length == 15 minutes || length == 30 minutes || length == 1 hours
-            || length == 20 hours;
+        return length >= 5 minutes && length <= 7 days && length % 1 minutes == 0;
     }
 
     /// Flip charges come back three times a round, whatever the round's length.
@@ -1080,7 +1080,7 @@ contract SherwoodArena {
         emit FlipsEnabledSet(enabled);
     }
 
-    /// Sets the length of rounds from the next round boundary on (5 min, 15 min, 30 min, 1 h or 20 h):
+    /// Sets the length of rounds from the next round boundary on (whole minutes, 5 min to 7 days):
     /// the round being played keeps its end. Before GENESIS it sets round 0's length. A second call before
     /// the boundary replaces the first.
     function setRoundLength(uint256 length) external onlyOwner {

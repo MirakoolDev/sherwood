@@ -203,7 +203,7 @@ Deployed on Robinhood Chain at [`0x45aC5C394f4fD8194fC4868c63A75d606a8A20CC`](ht
 - **Only arena moves score.** Buys made anywhere else score nothing, but they still pay the buy tax into the pot.
 - **Holdings instead of wallet balances.** The $PFWA a move buys stays in the arena under the player's address until they call `withdraw(amount)`. The settlement sell rule, the claim check and the +25% holder bonus all read `holdings(player)`, which only grows through `play()` (there is no deposit). So tokens borrowed for one transaction, such as a free Uniswap v4 flash take, can't pass them.
 - **Selling** starts with a withdraw, which doesn't wipe points. It costs at settlement instead: a winner whose holdings are below what the round's moves bought keeps only that share of the prize (withdrew 20%, lose 20%), and the rest rolls into the live pot. To claim, a winner must still have what they had at settlement.
-- **Rounds** are 1 hour at launch. The owner can set 5 min, 15 min, 30 min, 1 h or 20 h, from the next round boundary on; the round being played keeps its end.
+- **Rounds** are 20 hours at launch, as on v2.1. The owner can set any whole number of minutes from 5 min to 7 days (`setRoundLength`), from the next round boundary on (before round 1, at once), no new contract needed; the round being played keeps its end.
 - **Flip** uses [HoodRand](hoodrand/) and can be switched off by the owner (a FLIP then plays as a BUY). A HoodRand result is public about 15 seconds after the request and anyone can submit it, so an unanswered flip only expires (as a plain buy) after a day, HoodRand's refund window. Until then the round it belongs to waits to settle; later rounds settle as usual.
 - **The pot** is fed by the buy tax (paid to the pot vault, which forwards it to the arena), the trader share of arb recapture (credited to the router adapter, which passes it on), ETH anyone sends, and half of $PFWA's Pons creator-fee ETH through the fee splitter. There is no play fee (`playFeeBps` is 0).
 - **Split**, fixed in the contract:
@@ -223,10 +223,10 @@ The arena is being redeployed with the fixes from the security review below; rou
 
 | Contract | Address | Role |
 | --- | --- | --- |
-| [`SherwoodArena`](src/SherwoodArena.sol) | `0x73a12DD2dd9050320bd780DBdf1ba0fE0840FeA0` (pending) | The game |
-| [`SherwoodPotVault`](src/SherwoodPotVault.sol) | `0x67de94cd6EdC889671920547eDEC9a0d0f845D32` (pending) | The pool's buy-tax recipient; forwards every wei to the arena |
-| [`HookrRouterAdapter`](src/HookrRouterAdapter.sol) | `0xce5cBdFaD41cAa7665831F6aDFd5C0810dD3AAe4` (pending) | The arena's one swap, through Hookr's router; bound to the arena once |
-| [`SherwoodArenaDeployer`](src/SherwoodArenaDeployer.sol) | `0xA8fae5721F26f7E36972c98f4B4419323467E0E9` (pending) | Deploys the three above, wired together, in one transaction |
+| [`SherwoodArena`](src/SherwoodArena.sol) | `0x817063839b465823180BedC11601681A42E7d92f` (pending) | The game |
+| [`SherwoodPotVault`](src/SherwoodPotVault.sol) | `0xE0bF87424bBdBCBABf1d9A30B34671C3282eff1B` (pending) | The pool's buy-tax recipient; forwards every wei to the arena |
+| [`HookrRouterAdapter`](src/HookrRouterAdapter.sol) | `0x2507Fe3b9D792B63F10B96B617916ce611a2d48d` (pending) | The arena's one swap, through Hookr's router; bound to the arena once |
+| [`SherwoodArenaDeployer`](src/SherwoodArenaDeployer.sol) | `0x8Cbe9083cb12C316eBe96a005D0C9e17A7BF1961` (pending) | Deploys the three above, wired together, in one transaction |
 | [`PonsFeeSplitter`](src/PonsFeeSplitter.sol) | [`0x9C5d8E94343D51bB3656b068E4a91A7c3c50606e`](https://robinhoodchain.blockscout.com/address/0x9C5d8E94343D51bB3656b068E4a91A7c3c50606e) | Collects $PFWA's Pons fees; once a day sends a share of the ETH (half to start) to the pot vault and the rest, with all the $PFWA, to the treasury |
 
 Retired before launch, never played: arena [`0x097AcFfB2B247d9492983b3eb1F4a57820D1BAD1`](https://robinhoodchain.blockscout.com/address/0x097AcFfB2B247d9492983b3eb1F4a57820D1BAD1), vault [`0x77BC34F3669Ff7dd41C9C2Ca8F0201022f3Cbc68`](https://robinhoodchain.blockscout.com/address/0x77BC34F3669Ff7dd41C9C2Ca8F0201022f3Cbc68), adapter [`0x195554e3ec0678bF34e37b0E9aBdc5C0b5d89D52`](https://robinhoodchain.blockscout.com/address/0x195554e3ec0678bF34e37b0E9aBdc5C0b5d89D52) and deployer [`0xF178379a521bCc695c3896FD01bCD65b18239D9d`](https://robinhoodchain.blockscout.com/address/0xF178379a521bCc695c3896FD01bCD65b18239D9d) (GENESIS `1793631600`).
